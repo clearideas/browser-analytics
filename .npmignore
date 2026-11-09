@@ -1,0 +1,51 @@
+# Source files
+src/
+*.test.ts
+*.spec.ts
+
+# Development files
+rollup.config.js
+tsconfig.json
+.eslintrc.js
+.prettierrc
+.prettierignore
+
+# Documentation
+docs/
+
+# Testing
+vitest.config.ts
+__tests__/
+coverage/
+
+# Development dependencies and tools
+node_modules/
+.git/
+.github/
+
+# Build artifacts (keep dist/)
+*.tsbuildinfo
+.rpt2_cache/
+.rts2_cache_cjs/
+.rts2_cache_es/
+.rts2_cache_umd/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env*
+!.env.example
+
+# Misc
+*.tgz
+.yarn-integrity

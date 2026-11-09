@@ -1,0 +1,30 @@
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+jobs:
+  review:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: AI Code Review
+        uses: clearideas/ai-code-review-github-action@latest
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          ai_model: gpt-5.6-luna
+          fail_on_severity: '["critical","security"]'
+
+      - name: Upload AI Review Report
+        if: always() # Upload even if the review fails
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-report
+          path: ai-review-report-*.json
