@@ -1,10 +1,12 @@
 // Attribution tracking utilities
 import { resolveCookieDomain } from './cookie-domain'
+import { sanitizeUrl } from './core'
 import { getStorageItem, setStorageItem } from './storage'
 import type { AnalyticsConfig, AttributionData } from './types'
 import { debugLog, STORAGE_KEYS } from './types'
 
-// Attribution parameter keys to capture
+// Attribution parameter keys to capture. Only these keys are ever read from URLs,
+// storage or cookies; anything else is ignored.
 const ATTRIBUTION_PARAMS = [
   // Google Ads
   'gclid',
@@ -31,30 +33,88 @@ const ATTRIBUTION_PARAMS = [
   'ci_content',
 ] as const
 
+/** Longest accepted attribution parameter value; longer values are dropped, not truncated. */
+export const MAX_ATTRIBUTION_VALUE_LENGTH = 256
+const MAX_LANDING_PATH_LENGTH = 512
+const TIMESTAMP_FIELDS = ['landedAt', 'firstSeen', 'lastSeen'] as const
+const ATTRIBUTION_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 90 // 90 days
+
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/g
+
+function cleanAttributionValue(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const cleaned = value.replace(CONTROL_CHARS, '').trim()
+  if (!cleaned || cleaned.length > MAX_ATTRIBUTION_VALUE_LENGTH) return undefined
+  return cleaned
+}
+
+function cleanLandingPath(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const path = (value.split(/[?#]/, 1)[0] ?? '').replace(CONTROL_CHARS, '')
+  if (!path.startsWith('/') || path.length > MAX_LANDING_PATH_LENGTH) return undefined
+  return path
+}
+
+function cleanTimestamp(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length > 40 || Number.isNaN(Date.parse(value))) {
+    return undefined
+  }
+  return value
+}
+
+function cleanReferrer(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  return sanitizeUrl(value, { allowQueryParams: [] }) || undefined
+}
+
 /**
- * Extract attribution parameters from current URL
+ * Rebuild attribution data from untrusted input (URL, localStorage, cookie) using only
+ * known keys with bounded string values. Returns null if nothing usable remains.
+ */
+export function normalizeAttribution(input: unknown): AttributionData | null {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null
+  const source = input as Record<string, unknown>
+  const own = (key: string) =>
+    Object.prototype.hasOwnProperty.call(source, key) ? source[key] : undefined
+  const result: AttributionData = {}
+
+  for (const key of ATTRIBUTION_PARAMS) {
+    const value = cleanAttributionValue(own(key))
+    if (value) result[key] = value
+  }
+
+  const referrer = cleanReferrer(own('referrer'))
+  if (referrer) result.referrer = referrer
+  const landingPath = cleanLandingPath(own('landingPath'))
+  if (landingPath) result.landingPath = landingPath
+  for (const key of TIMESTAMP_FIELDS) {
+    const value = cleanTimestamp(own(key))
+    if (value) result[key] = value
+  }
+
+  return Object.keys(result).length > 0 ? result : null
+}
+
+function sameAttribution(a: AttributionData | null, b: AttributionData | null): boolean {
+  if (!a || !b) return a === b
+  const entries = (x: AttributionData) => JSON.stringify(Object.entries(x).sort())
+  return entries(a) === entries(b)
+}
+
+/**
+ * Extract known attribution parameters from a URL (defaults to the current URL).
  */
 export function extractAttributionFromUrl(url?: string): Partial<AttributionData> {
   const targetUrl = url || (typeof window !== 'undefined' ? window.location.href : '')
   if (!targetUrl) return {}
 
   try {
-    const urlObj = new URL(targetUrl)
-    const params = new URLSearchParams(urlObj.search)
+    const params = new URL(targetUrl).searchParams
     const attribution: Partial<AttributionData> = {}
 
-    ATTRIBUTION_PARAMS.forEach(key => {
-      const value = params.get(key)
-      if (value) {
-        ;(attribution as any)[key] = value
-      }
-    })
-
-    for (const [key, value] of params.entries()) {
-      if (!value) continue
-      if (key.startsWith('utm_') || key.startsWith('ci_')) {
-        ;(attribution as any)[key] = value
-      }
+    for (const key of ATTRIBUTION_PARAMS) {
+      const value = cleanAttributionValue(params.get(key))
+      if (value) attribution[key] = value
     }
 
     return attribution
@@ -64,74 +124,77 @@ export function extractAttributionFromUrl(url?: string): Partial<AttributionData
 }
 
 /**
- * Capture initial attribution data on first visit
+ * Read attribution for the current page view from the URL and referrer WITHOUT storing
+ * it. Safe to call before consent; the result can be held in memory and persisted with
+ * captureInitialAttribution() once storage is allowed.
  */
-export function captureInitialAttribution(config: AnalyticsConfig): AttributionData | null {
+export function readLandingAttribution(): AttributionData | null {
+  if (typeof window === 'undefined') return null
+
+  const urlAttribution = extractAttributionFromUrl()
+
+  // Debug parameters stand in for click IDs when the real ones are absent.
+  if (urlAttribution.bat_debug && !urlAttribution.msclkid) {
+    urlAttribution.msclkid = urlAttribution.bat_debug
+  }
+  if (urlAttribution.gtm_debug && !urlAttribution.gclid) {
+    urlAttribution.gclid = urlAttribution.gtm_debug
+  }
+
+  if (Object.keys(urlAttribution).length === 0) return null
+
+  return {
+    ...urlAttribution,
+    referrer: cleanReferrer(typeof document !== 'undefined' ? document.referrer : ''),
+    landingPath: cleanLandingPath(window.location.pathname),
+    landedAt: new Date().toISOString(),
+  }
+}
+
+/**
+ * Persist first-touch attribution. Existing stored attribution is preserved; otherwise
+ * `landing` (by default, the current URL) is stored. Call only when storage is allowed.
+ */
+export function captureInitialAttribution(
+  config: AnalyticsConfig,
+  landing: AttributionData | null = readLandingAttribution(),
+): AttributionData | null {
   if (typeof window === 'undefined') return null
 
   try {
     const storedExisting = getStoredAttributionData()
-    const existing = getAttributionContext()
-
-    // Extract attribution from URL
-    const urlAttribution = extractAttributionFromUrl()
-
-    // If bat_debug is present but msclkid is not, copy bat_debug to msclkid
-    if (urlAttribution.bat_debug && !urlAttribution.msclkid) {
-      urlAttribution.msclkid = urlAttribution.bat_debug
-    }
-
-    // If gtm_debug is present but gclid is not, copy gtm_debug to gclid
-    if (urlAttribution.gtm_debug && !urlAttribution.gclid) {
-      urlAttribution.gclid = urlAttribution.gtm_debug
-    }
-
-    // Only capture if we have meaningful attribution data
-    const hasAttributionData = Object.values(urlAttribution).some(
-      value => typeof value === 'string' && value.length > 0,
-    )
+    const existing = getAttributionContext(config)
 
     if (existing) {
-      if (hasAttributionData) {
-        debugLog(config, 'Attribution data already exists; preserving initial attribution', {
-          existing,
-          ignoredUrlAttribution: urlAttribution,
-        })
-      } else {
-        debugLog(
-          config,
-          'No attribution parameters found in URL; using stored attribution',
-          existing,
-        )
-      }
-      if (!storedExisting || JSON.stringify(storedExisting) !== JSON.stringify(existing)) {
+      debugLog(
+        config,
+        landing
+          ? 'Attribution data already exists; preserving initial attribution'
+          : 'No attribution parameters found in URL; using stored attribution',
+        existing,
+      )
+      if (!sameAttribution(storedExisting, existing)) {
         storeAttributionData(existing)
       }
       return existing
     }
 
-    if (!hasAttributionData) {
+    if (!landing) {
       debugLog(config, 'No attribution parameters found in URL')
       return null
     }
 
     const now = new Date().toISOString()
-
-    // Create complete attribution data
-    const attributionData: AttributionData = {
-      ...urlAttribution,
-      referrer: document.referrer || undefined,
-      landingPath: window.location.pathname,
-      landedAt: now,
-      firstSeen: now,
+    const attributionData = normalizeAttribution({
+      ...landing,
+      landedAt: landing.landedAt ?? now,
+      firstSeen: landing.landedAt ?? now,
       lastSeen: now,
-    }
+    })
+    if (!attributionData) return null
 
-    // Store attribution data
     storeAttributionData(attributionData)
-
     debugLog(config, 'Captured initial attribution data', attributionData)
-
     return attributionData
   } catch (error) {
     debugLog(config, 'Error capturing attribution data', error)
@@ -157,10 +220,10 @@ export function updateAttributionLastSeen(): void {
 }
 
 /**
- * Get stored attribution data from localStorage
+ * Get stored attribution data from localStorage (validated).
  */
 export function getStoredAttributionData(): AttributionData | null {
-  return getStorageItem<AttributionData>(STORAGE_KEYS.ATTRIBUTION_CONTEXT)
+  return normalizeAttribution(getStorageItem<unknown>(STORAGE_KEYS.ATTRIBUTION_CONTEXT))
 }
 
 /**
@@ -183,44 +246,40 @@ export function clearAttributionData(): void {
 }
 
 /**
- * Get attribution data as cookie value (for cross-subdomain access)
+ * Get the raw attribution cookie value, if present.
  */
 export function getAttributionCookieValue(): string | null {
   if (typeof document === 'undefined') return null
 
-  const cookies = document.cookie.split('; ')
-  const clickCookie = cookies.find(cookie =>
-    cookie.startsWith(`${STORAGE_KEYS.ATTRIBUTION_CONTEXT}=`),
-  )
+  const prefix = `${STORAGE_KEYS.ATTRIBUTION_CONTEXT}=`
+  const cookie = document.cookie
+    .split(';')
+    .map(part => part.trim())
+    .find(part => part.startsWith(prefix))
 
-  if (!clickCookie) return null
-
-  const value = clickCookie.split('=')[1]
-  return value || null
+  return cookie ? cookie.slice(prefix.length) || null : null
 }
 
 /**
- * Set attribution data as cookie for cross-subdomain access
+ * Share attribution across subdomains via a cookie on `cookieDomain` (e.g. `example.com`).
+ * Writes nothing unless the current host is that domain or one of its subdomains.
  */
-export function setAttributionCookie(data: AttributionData, domain?: string): void {
-  if (typeof document === 'undefined') return
+export function setAttributionCookie(data: AttributionData, cookieDomain?: string): void {
+  if (typeof document === 'undefined' || typeof window === 'undefined') return
 
   try {
-    const value = encodeURIComponent(JSON.stringify(data))
-    const maxAge = 60 * 60 * 24 * 90 // 90 days
-
-    const domainValue = resolveCookieDomain(window.location.hostname, domain)
+    const domain = resolveCookieDomain(window.location.hostname, cookieDomain)
+    const normalized = normalizeAttribution(data)
+    if (!domain || !normalized) return
 
     const attributes = [
-      `${STORAGE_KEYS.ATTRIBUTION_CONTEXT}=${value}`,
-      `Max-Age=${maxAge}`,
+      `${STORAGE_KEYS.ATTRIBUTION_CONTEXT}=${encodeURIComponent(JSON.stringify(normalized))}`,
+      `Max-Age=${ATTRIBUTION_COOKIE_MAX_AGE_SECONDS}`,
       'Path=/',
+      `Domain=${domain}`,
       'SameSite=Lax',
     ]
-
-    if (domainValue) {
-      attributes.push(`Domain=${domainValue}`)
-    }
+    if (window.location.protocol === 'https:') attributes.push('Secure')
 
     document.cookie = attributes.join('; ')
   } catch (error) {
@@ -290,16 +349,25 @@ export function isAttributionFromMicrosoftAds(attribution?: AttributionData | nu
 }
 
 /**
- * Get attribution context for current session
+ * Get validated attribution context for the current visitor.
+ *
+ * The cross-subdomain cookie is only read when `cookieDomain` is configured and matches
+ * the current host; otherwise a `ci_click` cookie (e.g. planted by a sibling subdomain)
+ * is ignored. Falls back to localStorage.
  */
-export function getAttributionContext(): AttributionData | null {
-  // Try cookie first (cross-subdomain), then localStorage
-  const cookieValue = getAttributionCookieValue()
-  if (cookieValue) {
-    try {
-      return JSON.parse(decodeURIComponent(cookieValue))
-    } catch {
-      // Invalid cookie data, fall back to localStorage
+export function getAttributionContext(
+  config?: Pick<AnalyticsConfig, 'cookieDomain'>,
+): AttributionData | null {
+  const hostname = typeof window !== 'undefined' ? window.location.hostname : null
+  if (resolveCookieDomain(hostname, config?.cookieDomain)) {
+    const cookieValue = getAttributionCookieValue()
+    if (cookieValue) {
+      try {
+        const fromCookie = normalizeAttribution(JSON.parse(decodeURIComponent(cookieValue)))
+        if (fromCookie) return fromCookie
+      } catch {
+        // Invalid cookie data, fall back to localStorage
+      }
     }
   }
 

@@ -1,8 +1,8 @@
 {
-  "name": "@clearideas/analytics",
-  "version": "0.1.0",
+  "name": "@clearideas/consent-analytics",
+  "version": "0.1.0-rc.1",
   "type": "module",
-  "description": "Privacy-focused analytics library for Nuxt and Vite applications",
+  "description": "Consent management and privacy-focused analytics for browser applications",
   "main": "dist/index.cjs",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
@@ -26,7 +26,29 @@
       "types": "./dist/vite.d.ts",
       "import": "./dist/vite.mjs",
       "require": "./dist/vite.cjs"
-    }
+    },
+    "./browser": {
+      "types": "./dist/browser.d.ts",
+      "import": "./dist/browser.mjs",
+      "require": "./dist/browser.cjs"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "import": "./dist/react.mjs",
+      "require": "./dist/react.cjs"
+    },
+    "./next": {
+      "types": "./dist/next.d.ts",
+      "import": "./dist/next.mjs",
+      "require": "./dist/next.cjs"
+    },
+    "./plugins": {
+      "types": "./dist/plugins/index.d.ts",
+      "import": "./dist/plugins.mjs",
+      "require": "./dist/plugins.cjs"
+    },
+    "./script": "./dist/analytics.js",
+    "./consent.css": "./dist/consent.css"
   },
   "files": [
     "dist",
@@ -34,54 +56,70 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "rollup -c --no-stdin && tsc --emitDeclarationOnly",
+    "build": "rollup -c --no-stdin && tsc --emitDeclarationOnly && node scripts/build-consent-css.mjs",
     "dev": "rollup -c -w",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:ui": "vitest --ui",
-    "lint": "eslint src",
-    "lint:fix": "eslint --fix src",
-    "format": "prettier --write 'src/**/*.ts' && eslint --fix src",
-    "type-check": "tsc --noEmit",
+    "lint": "eslint src test e2e sample-host/src sample-host/test",
+    "lint:fix": "eslint --fix src test e2e sample-host/src sample-host/test",
+    "format": "prettier --write 'src/**/*.ts' 'test/**/*.ts' 'e2e/**/*.ts' 'sample-host/src/**/*.ts' 'sample-host/test/**/*.ts' && npm run lint:fix",
+    "type-check": "tsc --noEmit && tsc -p tsconfig.test.json",
     "prepublishOnly": "npm run check",
     "release": "npm version patch && npm publish",
     "check:package": "node scripts/check-package.mjs",
-    "check": "npm run lint && npm run type-check && npm test && npm run build && npm run check:package"
+    "check": "npm run lint && npm run type-check && npm run test:coverage && npm run build && npm run check:package",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "npm run build && playwright test",
+    "playground": "npm run build && npm --prefix sample-host run dev",
+    "examples:build": "node examples/build.mjs",
+    "test:examples": "playwright test -c playwright.examples.config.ts"
   },
   "keywords": [
     "analytics",
-    "privacy",
+    "consent",
+    "cookie-banner",
     "gdpr",
+    "nextjs",
     "nuxt",
-    "vite",
+    "privacy",
+    "react",
+    "tracking",
     "typescript",
-    "tracking"
+    "vite"
   ],
   "author": "Clear Ideas",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/clearideas/browser-analytics.git"
+    "url": "git+https://github.com/clearideas/consent-analytics.git"
   },
   "bugs": {
-    "url": "https://github.com/clearideas/browser-analytics/issues"
+    "url": "https://github.com/clearideas/consent-analytics/issues"
   },
-  "homepage": "https://github.com/clearideas/browser-analytics#readme",
+  "homepage": "https://github.com/clearideas/consent-analytics#readme",
   "peerDependencies": {
-    "nuxt": "^4.6.4",
-    "vue": "^3.5.45",
-    "vue-router": "^5.4.0"
+    "nuxt": "^3.0.0 || ^4.0.0",
+    "react": ">=18.0.0",
+    "next": ">=13.4.0"
   },
   "peerDependenciesMeta": {
-    "vue-router": {
+    "nuxt": {
       "optional": true
     },
-    "nuxt": {
+    "react": {
+      "optional": true
+    },
+    "next": {
       "optional": true
     }
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.0",
+    "@rollup/plugin-terser": "^1.0.2",
     "@types/node": "^24.19.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "@typescript-eslint/eslint-plugin": "^8.72.1",
     "@typescript-eslint/parser": "^8.72.1",
     "@vitest/coverage-v8": "^5.1.0",
@@ -90,14 +128,15 @@
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-prettier": "^5.5.7",
     "eslint-plugin-simple-import-sort": "^14.0.0",
+    "happy-dom": "^21.0.4",
     "prettier": "^3.9.10",
-    "rollup": "^4.68.2",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "rollup": "^4.67.4",
     "tslib": "^2.9.1",
     "typescript": "^6.0.3",
-    "vite": "^8.3.7",
-    "vitest": "^5.1.0",
-    "vue": "^3.5.45",
-    "vue-router": "^5.4.0"
+    "vite": "^8.3.5",
+    "vitest": "^5.1.0"
   },
   "engines": {
     "node": "^22.22.3 || ^24.15.0 || >=26.0.0",
@@ -109,5 +148,7 @@
   },
   "overrides": {
     "minimatch": "^11.0.5"
-  }
+  },
+  "unpkg": "dist/analytics.js",
+  "jsdelivr": "dist/analytics.js"
 }

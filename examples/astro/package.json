@@ -1,0 +1,11 @@
+{
+  "name": "example-astro",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "astro build"
+  },
+  "dependencies": {
+    "astro": "7.3.5"
+  }
+}

@@ -1,0 +1,567 @@
+openapi: 3.1.0
+info:
+  title: Clear Ideas Browser Analytics Collector API
+  version: 1.0.0
+  summary: The HTTP contract between @clearideas/consent-analytics (browser) and a collector backend.
+  license:
+    name: MIT
+    identifier: MIT
+  description: |
+    This document is the contract that `@clearideas/consent-analytics` speaks. Any backend that
+    implements it can receive events and consent records from the browser library.
+    A reference implementation lives in `sample-host/`.
+
+    The key words MUST, MUST NOT, SHOULD and MAY are used as described in RFC 2119.
+
+    ## Model
+
+    * **Site key.** Each website is identified by a public `siteKey`. It is not a
+      secret: it is embedded in pages. Servers MUST restrict each site key to an
+      allowlist of browser origins (see *Origins and CORS*).
+    * **Consent decision lives in the browser.** The visitor's decision is stored in
+      first-party storage on the website. The server does not hold consent state
+      for the browser and there is no "get my consent" endpoint. This avoids
+      cross-site cookies, which Safari and Firefox block. The server receives an
+      append-only **consent record** for each decision (proof of consent, as GDPR
+      Art. 7(1) expects the site to be able to show).
+    * **Consent categories.** Choices are made per category: `preferences`,
+      `statistics` (analytics) and `marketing` (advertising); `necessary` is always
+      allowed. Sites may ask a single accept/reject question, which is recorded as the
+      same choice for every category.
+    * **Consent policy comes from the server.** `GET /v1/context` tells the browser
+      whether consent is required for this visitor (typically based on the
+      visitor's region) and the current `policyVersion`. When the policy version
+      changes, the browser asks for consent again.
+    * **No cookies.** The browser sends requests without credentials
+      (`credentials: 'omit'`). Servers MUST NOT rely on cookies. (`sendBeacon`
+      may still attach cookies that exist for the API origin; servers MUST NOT
+      use them to identify visitors.)
+
+    ## Origins and CORS
+
+    * A request whose `Origin` header is not in the site's allowlist MUST be
+      rejected with `403`.
+    * `POST` requests MUST carry an allowed `Origin`. (Browsers always send it on
+      `POST`.) `GET /v1/context` MAY be accepted without an `Origin` header, which
+      browsers omit for same-origin `GET`.
+    * For allowed origins, responses (including error responses) MUST include
+      `Access-Control-Allow-Origin: <origin>` and `Vary: Origin`. Servers MUST
+      NOT send `Access-Control-Allow-Credentials`.
+    * `OPTIONS` preflight requests MUST be answered with `204`, allowing methods
+      `GET, POST` and header `Content-Type`, for origins allowed by any site.
+
+    ## Request bodies
+
+    * `POST` bodies are JSON. Servers MUST accept both `application/json` and
+      `text/plain` (optionally with `;charset=UTF-8`). The browser sends
+      `text/plain` so that `fetch` needs no preflight and `navigator.sendBeacon`
+      works across origins. Other media types MUST be rejected with `415`.
+    * `POST /v1/events` bodies MUST NOT exceed 65,536 bytes (the `sendBeacon`
+      limit). `POST /v1/consent` bodies MUST NOT exceed 4,096 bytes. Larger
+      bodies MUST be rejected with `413`.
+
+    ## Delivery, retries and idempotency
+
+    * Every event carries a client-generated `eventId`. Servers MUST treat
+      `(siteKey, eventId)` as unique and MUST NOT store an event twice. A repeated
+      event counts as a duplicate, not an error, so retries are safe.
+    * Clients retry a batch after a network error or a `408`, `429` or `5xx`
+      response. Other `4xx` responses are final and the batch is dropped.
+    * Timestamps from the browser (`occurredAt`, `sentAt`) are not trustworthy.
+      Servers SHOULD record their own receive time and MAY use
+      `receivedAt - sentAt` to correct clock skew.
+
+    ## Tracking categories
+
+    * `full`: statistics consent was granted, or consent is not required for this
+      visitor (and statistics was not explicitly refused).
+    * `limited`: consent is required and statistics consent is not given (undecided
+      or refused). Unless the policy says `trackingWithoutConsent: none`, the browser
+      sends only essential and anonymous events (`page_view`, `page_exit`,
+      `auto_metrics`, `web_vital`, `error`) with an allowlisted set of fields. URLs
+      are reduced to origin + path, and `sessionId` is a per-tab anonymous
+      identifier. Servers MUST NOT join `limited` events with persistent
+      identifiers or with `full` events from the same browser.
+
+    ## Standard events
+
+    Event names are open-ended (`^[a-z][a-z0-9_]{0,63}$`). The library emits:
+
+    | name | when | notable props |
+    | --- | --- | --- |
+    | `page_view` | initial load and each route change | `url`, `path`, `referrer`, `title` |
+    | `page_exit` | leaving a page (route change, tab hidden, unload) | `timeSpent`, `clicks`, `keypresses`, `maxScrollDepth` |
+    | `scroll_depth` | new maximum scroll depth ≥ 25% | `depth`, `path` |
+    | `time_spent` | page hidden after ≥ 30 s | `timeSpent` |
+    | `outbound_link_click` | click on a link to another origin | `outboundUrl`, `outboundHost` |
+    | `web_vital` | performance metric observed | `name` (`LCP`, `FID`, `CLS`, `FCP`, `TTFB`), `value` |
+    | `auto_metrics` | page load metrics | `pageLoadTime`, `domContentLoadedTime`, ... |
+    | `error` | `trackError()` | `message` |
+
+    In `full` events, `props.attribution` holds first-touch attribution
+    (`utm_*`, `ci_*`, click IDs, `landingPath`, `referrer`, timestamps).
+servers:
+  - url: '{apiBaseUrl}'
+    description: Collector base URL (the library's `apiBaseUrl`)
+    variables:
+      apiBaseUrl:
+        default: http://localhost:8787
+tags:
+  - name: context
+    description: Per-visitor policy for the browser library
+  - name: events
+    description: Analytics event ingestion
+  - name: consent
+    description: Consent records (proof of consent)
+  - name: operations
+    description: Operational endpoints
+paths:
+  /v1/context:
+    get:
+      tags: [context]
+      operationId: getContext
+      summary: Get the consent policy for the current visitor
+      description: |
+        Called once per browser session (the browser caches the response for
+        `ttlSeconds`). The server determines the visitor's region by any means
+        (IP geolocation service, CDN country header, ...). If the region cannot be
+        determined, `consentRequired` MUST be `true`.
+      parameters:
+        - name: siteKey
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/SiteKey'
+      responses:
+        '200':
+          description: Policy for this visitor
+          headers:
+            Cache-Control:
+              description: MUST prevent shared caching (the answer depends on the visitor), e.g. `private, no-store`.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Context'
+              example:
+                v: 1
+                siteKey: demo-site
+                policy:
+                  consentRequired: true
+                  policyVersion: '2026-11-01'
+                  trackingWithoutConsent: limited
+                  reason: region
+                geo:
+                  country: DE
+                  continent: EU
+                ttlSeconds: 3600
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/events:
+    post:
+      tags: [events]
+      operationId: postEvents
+      summary: Submit a batch of events
+      description: |
+        Individually invalid events are reported in `rejected` while the valid
+        events of the same batch are accepted. An invalid envelope (wrong `v`,
+        unknown `siteKey`, missing `events`, ...) rejects the whole request.
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              $ref: '#/components/schemas/EventBatch'
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventBatch'
+            example:
+              v: 1
+              siteKey: demo-site
+              sentAt: '2026-11-10T12:00:01.000Z'
+              events:
+                - eventId: 6730a1f0c3d4e5f6a7b8c9d0
+                  name: page_view
+                  occurredAt: '2026-11-10T12:00:00.000Z'
+                  sessionId: 6730a1f0aabbccddeeff0011
+                  pageViewId: 6730a1f0c3d4e5f6a7b8c9d0
+                  trackingCategory: full
+                  consent:
+                    required: false
+                    granted: false
+                  props:
+                    url: https://www.example.com/pricing
+                    path: /pricing
+                    title: Pricing
+      responses:
+        '202':
+          description: Batch processed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventBatchResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/consent:
+    post:
+      tags: [consent]
+      operationId: postConsent
+      summary: Record a consent decision
+      description: |
+        Appends a consent record. Records are never updated; a withdrawal is a new
+        record with `decision: denied` and the same `consentId`. Servers SHOULD NOT
+        store IP addresses with consent records.
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              $ref: '#/components/schemas/ConsentRecordRequest'
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsentRecordRequest'
+            example:
+              v: 1
+              siteKey: demo-site
+              consentId: 6730a1f0c3d4e5f6a7b8c9d1
+              decision: granted
+              categories:
+                preferences: true
+                statistics: true
+                marketing: true
+              policyVersion: '2026-11-01'
+              decidedAt: '2026-11-10T12:00:05.000Z'
+              source: banner
+      responses:
+        '201':
+          description: Record stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsentRecordResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/health:
+    get:
+      tags: [operations]
+      operationId: getHealth
+      summary: Liveness check (optional)
+      responses:
+        '200':
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    const: ok
+components:
+  schemas:
+    SiteKey:
+      type: string
+      description: Public identifier of a website. Not a secret.
+      pattern: '^[A-Za-z0-9._-]{3,64}$'
+    Identifier:
+      type: string
+      description: Client-generated identifier (the library uses 24 lowercase hex characters).
+      pattern: '^[A-Za-z0-9_-]{8,64}$'
+    Timestamp:
+      type: string
+      format: date-time
+      maxLength: 40
+    EventName:
+      type: string
+      pattern: '^[a-z][a-z0-9_]{0,63}$'
+    CountryCode:
+      type: string
+      description: ISO 3166-1 alpha-2
+      pattern: '^[A-Z]{2}$'
+    Context:
+      type: object
+      additionalProperties: false
+      required: [v, siteKey, policy, ttlSeconds]
+      properties:
+        v:
+          const: 1
+        siteKey:
+          $ref: '#/components/schemas/SiteKey'
+        policy:
+          type: object
+          additionalProperties: false
+          required: [consentRequired, policyVersion, reason]
+          properties:
+            consentRequired:
+              type: boolean
+              description: Whether the visitor must opt in before full tracking and third-party tags.
+            policyVersion:
+              type: string
+              minLength: 1
+              maxLength: 64
+              description: Changes whenever the site's consent policy changes. Stored decisions for another version are no longer valid.
+            trackingWithoutConsent:
+              type: string
+              enum: [limited, none]
+              description: |
+                What the browser may send while statistics consent is not given (undecided or refused), where consent is required. `limited` (default when absent): anonymous essential events only (see *Tracking categories*). `none`: nothing. Lets a collector be stricter in specific regions.
+            reason:
+              type: string
+              enum: [region, site, unknown-region]
+              description: |
+                `region`: decided by the visitor's region. `site`: the site requires (or never requires) consent regardless of region. `unknown-region`: the region could not be determined, so consent is required.
+        geo:
+          type: object
+          additionalProperties: false
+          description: Coarse location, if known. Never more precise than country.
+          properties:
+            country:
+              $ref: '#/components/schemas/CountryCode'
+            continent:
+              type: string
+              enum: [AF, AN, AS, EU, NA, OC, SA]
+        ttlSeconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          description: How long the browser may reuse this answer.
+    PropValue:
+      description: Event property value. Strings are limited to 2048 characters; arrays and objects may nest.
+      type: [string, number, boolean, 'null', array, object]
+      maxLength: 2048
+      maxItems: 50
+      maxProperties: 50
+      items:
+        $ref: '#/components/schemas/PropValue'
+      additionalProperties:
+        $ref: '#/components/schemas/PropValue'
+    Event:
+      type: object
+      additionalProperties: false
+      required: [eventId, name, occurredAt, sessionId, trackingCategory, consent, props]
+      properties:
+        eventId:
+          $ref: '#/components/schemas/Identifier'
+        name:
+          $ref: '#/components/schemas/EventName'
+        occurredAt:
+          $ref: '#/components/schemas/Timestamp'
+        sessionId:
+          $ref: '#/components/schemas/Identifier'
+        pageViewId:
+          $ref: '#/components/schemas/Identifier'
+        trackingCategory:
+          type: string
+          enum: [full, limited]
+        consent:
+          type: object
+          additionalProperties: false
+          required: [required, granted]
+          properties:
+            required:
+              type: boolean
+              description: Consent was required for this visitor when the event occurred.
+            granted:
+              type: boolean
+              description: The visitor had granted statistics consent (analytics) when the event occurred.
+        props:
+          type: object
+          maxProperties: 100
+          additionalProperties:
+            $ref: '#/components/schemas/PropValue'
+    EventBatch:
+      type: object
+      additionalProperties: false
+      required: [v, siteKey, sentAt, events]
+      properties:
+        v:
+          const: 1
+        siteKey:
+          $ref: '#/components/schemas/SiteKey'
+        sentAt:
+          $ref: '#/components/schemas/Timestamp'
+        events:
+          type: array
+          minItems: 1
+          maxItems: 50
+          description: Each item is validated individually; see `EventBatchResult.rejected`.
+          items:
+            type: object
+    EventBatchResult:
+      type: object
+      additionalProperties: false
+      required: [accepted, duplicates, rejected]
+      properties:
+        accepted:
+          type: integer
+          minimum: 0
+          description: Newly stored events.
+        duplicates:
+          type: integer
+          minimum: 0
+          description: Events whose eventId had already been stored.
+        rejected:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [index, errors]
+            properties:
+              index:
+                type: integer
+                minimum: 0
+                description: Position in the submitted `events` array.
+              eventId:
+                type: string
+              errors:
+                type: array
+                items:
+                  $ref: '#/components/schemas/FieldError'
+    ConsentRecordRequest:
+      type: object
+      additionalProperties: false
+      required: [v, siteKey, consentId, decision, policyVersion, decidedAt, source]
+      properties:
+        v:
+          const: 1
+        siteKey:
+          $ref: '#/components/schemas/SiteKey'
+        consentId:
+          $ref: '#/components/schemas/Identifier'
+          description: Stable per browser; all decisions from the same browser share it.
+        decision:
+          type: string
+          enum: [granted, denied, partial]
+          description: '`granted`: every category accepted. `denied`: every optional category refused. `partial`: a choice per category (see `categories`).'
+        categories:
+          $ref: '#/components/schemas/CategoryChoices'
+        policyVersion:
+          type: string
+          minLength: 1
+          maxLength: 64
+        decidedAt:
+          $ref: '#/components/schemas/Timestamp'
+        source:
+          type: string
+          enum: [banner, api]
+          description: '`banner`: the built-in banner. `api`: the site called the consent API (e.g. its own UI).'
+    CategoryChoices:
+      type: object
+      additionalProperties: false
+      required: [preferences, statistics, marketing]
+      description: |
+        The visitor's choice per consent category (necessary is always allowed). Sites using a single accept/reject choice send the same value for all three.
+      properties:
+        preferences:
+          type: boolean
+        statistics:
+          type: boolean
+        marketing:
+          type: boolean
+    ConsentRecordResult:
+      type: object
+      additionalProperties: false
+      required: [recordId, consentId, recordedAt]
+      properties:
+        recordId:
+          type: string
+        consentId:
+          $ref: '#/components/schemas/Identifier'
+        recordedAt:
+          $ref: '#/components/schemas/Timestamp'
+    FieldError:
+      type: object
+      additionalProperties: false
+      required: [path, message]
+      properties:
+        path:
+          type: string
+          description: JSON Pointer to the offending value, relative to the request body or event.
+        message:
+          type: string
+    Problem:
+      type: object
+      description: RFC 9457 problem details.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldError'
+  responses:
+    BadRequest:
+      description: Malformed JSON, schema violation, or invalid parameter
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: Origin not allowed for this site key (or missing on POST)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Unknown site key
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    PayloadTooLarge:
+      description: Body exceeds the size limit
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnsupportedMediaType:
+      description: Content-Type is not application/json or text/plain
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: Rate limited. Clients retry later; `Retry-After` SHOULD be set.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'

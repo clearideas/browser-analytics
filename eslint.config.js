@@ -6,7 +6,7 @@ import simpleImportSort from 'eslint-plugin-simple-import-sort'
 
 export default [
   {
-    ignores: ['dist/**', 'node_modules/**', '**/*.test.ts', '**/*.spec.ts'],
+    ignores: ['dist/**', '**/node_modules/**', 'coverage/**', 'test-results/**', 'playwright-report/**'],
   },
   {
     files: ['**/*.ts'],

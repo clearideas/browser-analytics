@@ -1,8 +1,22 @@
-# updates Usage Guide
+# Clear Ideas Chat widget: CDN usage
 
-This guide shows how to integrate the Clear Ideas Chat Widget via updates.
+The chat widget can be embedded on any page from the CDN. With `@clearideas/consent-analytics`, configure it as an integration instead (`integrations.clearIdeasChat`): it then loads and follows the visitor's consent state automatically. Pin a versioned URL and set `integrity` (Subresource Integrity) in production:
 
-## updates URLs
+```json
+{
+  "clearIdeasChat": {
+    "accessKey": "your-access-key-here",
+    "widgetUrl": "https://updates.clearideas.com/v0.1.0/chat.js",
+    "cssUrl": "https://updates.clearideas.com/v0.1.0/chat.css",
+    "integrity": "sha384-…",
+    "cssIntegrity": "sha384-…"
+  }
+}
+```
+
+The rest of this page describes embedding the widget directly.
+
+## CDN URLs
 
 ### Latest Version (Recommended)
 Always points to the latest release:
@@ -199,7 +213,7 @@ You can also initialize the widget programmatically:
 
 ## Consent Management
 
-The widget supports delaying initialization until consent is granted. This is useful for GDPR compliance.
+The widget supports delaying initialization until consent is granted, so cookies and `localStorage` are only used once a visitor has agreed to them.
 
 ### Using Global Variable
 
@@ -259,9 +273,9 @@ For auto-initialization with data attributes, you can dispatch a custom event wh
 </script>
 ```
 
-## GDPR Consent Compliance
+## Consent-Aware Storage (GDPR regions)
 
-The widget supports GDPR-compliant consent management through `consentRequired` and `consentGranted` props. When consent is required but not granted, the widget uses `sessionStorage` instead of `localStorage` and does not send cookies to the server.
+For visitors where consent is required (for example under GDPR and the ePrivacy Directive in the EU), the widget supports consent-aware storage through the `consentRequired` and `consentGranted` props. When consent is required but not granted, the widget uses `sessionStorage` instead of `localStorage` and does not send cookies to the server. Whether consent is required for your visitors, and what counts as "granted," is determined by your own consent logic (e.g. your cookie banner) — the props below just tell the widget what to do once you've made that call.
 
 ### How It Works
 
@@ -415,7 +429,7 @@ interface WidgetConfig {
   // Consent management
   hasConsent?: boolean | (() => boolean) | string;
 
-  // GDPR consent compliance
+  // Consent-aware storage (e.g. GDPR regions)
   // If true, consent is required before using cookies/localStorage
   // When true and consentGranted is false, widget uses sessionStorage only
   consentRequired?: boolean;

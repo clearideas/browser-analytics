@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   review:
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    if: ${{ vars.AI_REVIEW_ENABLED == 'true' && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     steps:
       - name: AI Code Review

@@ -77,3 +77,8 @@ jspm_packages/
 *.pem
 *.key
 *.tgz
+
+# Sample host data and end-to-end test output
+sample-host/data/
+test-results/
+playwright-report/

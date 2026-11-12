@@ -1,0 +1,17 @@
+[
+  {
+    "siteKey": "demo-site",
+    "name": "Example apps",
+    "allowedOrigins": [
+      "http://localhost:15201",
+      "http://localhost:15202",
+      "http://localhost:15203",
+      "http://localhost:15204",
+      "http://localhost:15205",
+      "http://localhost:15206",
+      "http://localhost:15207"
+    ],
+    "policyVersion": "1",
+    "consentMode": "geo"
+  }
+]

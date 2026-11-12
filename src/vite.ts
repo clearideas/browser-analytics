@@ -1,5 +1,5 @@
 // Vite SPA wrapper for the shared analytics core
-import { DEFAULT_CONFIG, getConsentBannerHTML } from './core'
+import { DEFAULT_CONFIG } from './core'
 import { initAnalytics } from './index'
 import type { Analytics, AnalyticsConfig, FrameworkAdapter } from './types'
 import { debugLog } from './types'
@@ -10,6 +10,7 @@ declare global {
     readonly VITE_API_BASE_URL?: string
     readonly VITE_WEBSITE_BASE_URL?: string
     readonly VITE_EVENT_SITE_NAME?: string
+    readonly VITE_ANALYTICS_SITE_KEY?: string
     readonly VITE_GA_MEASUREMENT_ID?: string
     readonly VITE_GOOGLE_ADS_CONVERSIONS?: string
     readonly VITE_OPENAI_ADS_PIXEL_ID?: string
@@ -48,6 +49,15 @@ declare global {
     readonly VITE_ANALYTICS_TRACK_TIME_SPENT?: string
     readonly VITE_ANALYTICS_TRACK_OUTBOUND_LINKS?: string
     readonly VITE_ANALYTICS_DEBUG?: string
+    readonly VITE_ANALYTICS_COOKIE_DOMAIN?: string
+    readonly VITE_ANALYTICS_URL_QUERY_ALLOWLIST?: string
+    readonly VITE_ANALYTICS_EXPOSE_GLOBALS?: string
+    readonly VITE_ANALYTICS_CLEAN_ATTRIBUTION_URL?: string
+    readonly VITE_ANALYTICS_INTEGRATIONS?: string
+    readonly VITE_ANALYTICS_BANNER?: string
+    readonly VITE_ANALYTICS_RESPECT_GPC?: string
+    readonly VITE_ANALYTICS_CONSENT?: string
+    readonly VITE_ANALYTICS_GATED_SCRIPTS?: string
     readonly NODE_ENV?: string
   }
 
@@ -61,6 +71,29 @@ function parseNumberEnv(value: string | undefined): number | undefined {
   if (!value || value.trim() === '') return undefined
   const num = Number(value)
   return !isNaN(num) ? num : undefined
+}
+
+// Parse a JSON object from an environment variable (undefined if unset or invalid)
+function parseJsonEnv(name: string, value: string | undefined): any {
+  if (!value || !value.trim()) return undefined
+  try {
+    const parsed = JSON.parse(value)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed
+  } catch {
+    // fall through
+  }
+  console.warn(`🔍 [Analytics] Ignoring ${name}: expected a JSON object`)
+  return undefined
+}
+
+// Parse a comma-separated list (e.g. "q,page") into trimmed, non-empty entries
+function parseListEnv(value: string | undefined): string[] | undefined {
+  if (!value) return undefined
+  const items = value
+    .split(',')
+    .map(item => item.trim())
+    .filter(Boolean)
+  return items.length > 0 ? items : undefined
 }
 
 // Vite SPA adapter for Vue Router
@@ -132,7 +165,8 @@ export function createViteAdapter(router?: any): FrameworkAdapter {
 
       return {
         apiBaseUrl: import.meta.env.VITE_API_BASE_URL || DEFAULT_CONFIG.apiBaseUrl,
-        eventSiteName: import.meta.env.VITE_EVENT_SITE_NAME || 'vite-app',
+        siteKey: import.meta.env.VITE_ANALYTICS_SITE_KEY || undefined,
+        eventSiteName: import.meta.env.VITE_EVENT_SITE_NAME || 'vite-app', // fallback site key
         gaMeasurementId: import.meta.env.VITE_GA_MEASUREMENT_ID,
         googleAdsConversions,
         openAIAdsPixelId: import.meta.env.VITE_OPENAI_ADS_PIXEL_ID,
@@ -196,8 +230,30 @@ export function createViteAdapter(router?: any): FrameworkAdapter {
         autoTrackScrollDepth: import.meta.env.VITE_ANALYTICS_TRACK_SCROLL_DEPTH !== 'false',
         autoTrackTimeSpent: import.meta.env.VITE_ANALYTICS_TRACK_TIME_SPENT !== 'false',
         autoTrackOutboundLinks: import.meta.env.VITE_ANALYTICS_TRACK_OUTBOUND_LINKS !== 'false',
+        cleanAttributionUrl: import.meta.env.VITE_ANALYTICS_CLEAN_ATTRIBUTION_URL !== 'false',
+        cookieDomain: import.meta.env.VITE_ANALYTICS_COOKIE_DOMAIN || undefined,
+        urlQueryAllowlist: parseListEnv(import.meta.env.VITE_ANALYTICS_URL_QUERY_ALLOWLIST),
+        exposeGlobals: import.meta.env.VITE_ANALYTICS_EXPOSE_GLOBALS === 'true',
+        integrations: parseJsonEnv(
+          'VITE_ANALYTICS_INTEGRATIONS',
+          import.meta.env.VITE_ANALYTICS_INTEGRATIONS,
+        ),
+        banner:
+          import.meta.env.VITE_ANALYTICS_BANNER === 'false'
+            ? false
+            : parseJsonEnv('VITE_ANALYTICS_BANNER', import.meta.env.VITE_ANALYTICS_BANNER),
+        respectGlobalPrivacyControl: import.meta.env.VITE_ANALYTICS_RESPECT_GPC !== 'false',
+        consent: parseJsonEnv('VITE_ANALYTICS_CONSENT', import.meta.env.VITE_ANALYTICS_CONSENT),
+        gatedScripts:
+          import.meta.env.VITE_ANALYTICS_GATED_SCRIPTS === 'false'
+            ? false
+            : parseJsonEnv(
+                'VITE_ANALYTICS_GATED_SCRIPTS',
+                import.meta.env.VITE_ANALYTICS_GATED_SCRIPTS,
+              ),
         debug: debugEnabled,
         nodeEnv: import.meta.env.NODE_ENV,
+        websiteBaseUrl: import.meta.env.VITE_WEBSITE_BASE_URL || undefined,
       }
     },
 
@@ -254,42 +310,23 @@ export function createViteAdapter(router?: any): FrameworkAdapter {
       return () => {}
     },
 
-    showConsentBanner(onAccept: () => void, onReject: () => void) {
-      if (typeof document === 'undefined') return
-
-      // Check if banner already exists
-      if (document.getElementById('ci-consent-banner')) {
-        return
-      }
-
-      const banner = document.createElement('div')
-      banner.id = 'ci-consent-banner'
-      banner.innerHTML = getConsentBannerHTML(import.meta.env.VITE_WEBSITE_BASE_URL || '')
-
-      document.body.appendChild(banner)
-
-      // Add event listeners
-      document.getElementById('ci-consent-accept')?.addEventListener('click', () => {
-        document.body.removeChild(banner)
-        onAccept()
-      })
-
-      document.getElementById('ci-consent-reject')?.addEventListener('click', () => {
-        document.body.removeChild(banner)
-        onReject()
-      })
-    },
-
     getRouter() {
       return router
     },
   }
 }
 
+// The instance created by initViteAnalytics (module scope; nothing is put on window)
+let viteAnalytics: Analytics | null = null
+
 // Initialize analytics for Vite SPA
-export function initViteAnalytics(router?: any): Analytics {
+export function initViteAnalytics(
+  router?: any,
+  overrides: Partial<AnalyticsConfig> = {},
+): Analytics {
   const adapter = createViteAdapter(router)
-  const config = adapter.getConfig()
+  const config = { ...adapter.getConfig(), ...overrides }
+  adapter.getConfig = () => config
 
   debugLog(config, 'Vite analytics initializing')
 
@@ -308,27 +345,15 @@ export function initViteAnalytics(router?: any): Analytics {
     hasRouter: !!router,
   })
 
+  // Page views (initial and on route change) are tracked by auto-tracking in
+  // initAnalytics; registering another route listener here would double count them.
   const analytics = initAnalytics(config, adapter)
+  viteAnalytics = analytics
 
-  // Set up route change tracking (initAnalytics handles initial page view)
-  const unsubscribeRouteChange = adapter.onRouteChange((path: string) => {
-    analytics.trackEvent('page_view', {
-      path,
-      url: adapter.getCurrentUrl(),
-      referrer: adapter.getReferrer(),
-    })
-  })
-
-  // Clean up on app destroy
+  // Flush pending events on app destroy
   adapter.onAppDestroy(() => {
-    unsubscribeRouteChange()
     analytics.flush()
   })
-
-  // Expose globally for development
-  if (typeof window !== 'undefined') {
-    ;(window as any).analytics = analytics
-  }
 
   debugLog(config, 'Vite analytics initialization complete')
   return analytics
@@ -336,8 +361,8 @@ export function initViteAnalytics(router?: any): Analytics {
 
 // Vue composable for using analytics in components
 export function useAnalytics(): Analytics {
-  if (typeof window === 'undefined' || !(window as any).analytics) {
+  if (!viteAnalytics) {
     throw new Error('Analytics not initialized. Call initViteAnalytics() first.')
   }
-  return (window as any).analytics
+  return viteAnalytics
 }

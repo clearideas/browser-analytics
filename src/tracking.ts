@@ -1,18 +1,22 @@
 // Core event tracking functionality
 import {
-  getConsentStatus,
-  getTrackingCategory,
+  getConsentCategories,
+  getTrackingWithoutConsent,
   isConsentRequired,
   shouldTrackEvent,
 } from './consent'
 import {
   createAnonymousEventData,
+  fitPropsToContract,
   generateObjectId,
   getConnectionType,
   getDeviceBucket,
   getSafeLocationContext,
   getViewportBucket,
   isEssentialEvent,
+  normalizeEventName,
+  sanitizeEventUrls,
+  sanitizeUrl,
 } from './core'
 import {
   getOrCreateAnonymousSessionId,
@@ -21,92 +25,149 @@ import {
   saveEventQueue,
 } from './storage'
 import type { AnalyticsConfig, AnalyticsEvent, TrackingContext } from './types'
-import { debugLog } from './types'
+import { debugLog, getSiteKey } from './types'
 
 // Event queue and batching
 let eventQueue: AnalyticsEvent[] = []
 let flushTimerId: number | null = null
-const retryQueue: Map<string, { payload: string; attempts: number; id: string }> = new Map()
+// Batches awaiting (re)delivery via fetch. `inFlight` ensures concurrent callers
+// (sendBatch, the flush timer, flush()) never POST the same batch twice at once.
+const retryQueue: Map<
+  string,
+  { payload: string; attempts: number; id: string; inFlight: boolean }
+> = new Map()
 
-// Initialize queue from storage
+// Limits from spec/openapi.yaml. Batches stay below the 64 KiB limit shared by
+// sendBeacon, keepalive fetch and the collector.
+const MAX_EVENTS_PER_BATCH = 50
+const MAX_BATCH_BYTES = 60_000
+const MAX_EVENT_BYTES = 32_000
+// text/plain keeps requests "simple" for CORS: no preflight, and sendBeacon works
+// cross-origin. The collector parses the body as JSON.
+const BODY_CONTENT_TYPE = 'text/plain;charset=UTF-8'
+
+const utf8Length = (text: string) => new TextEncoder().encode(text).length
+
+function eventsEndpoint(config: AnalyticsConfig): string {
+  return `${config.apiBaseUrl.replace(/\/$/, '')}/v1/events`
+}
+
+function isV1Event(value: unknown): value is AnalyticsEvent {
+  const event = value as AnalyticsEvent
+  return (
+    !!event &&
+    typeof event.eventId === 'string' &&
+    typeof event.name === 'string' &&
+    !!event.props &&
+    typeof event.props === 'object'
+  )
+}
+
+// Initialize queue from storage (events queued by pre-v1 versions are discarded)
 export function initializeEventQueue(config?: AnalyticsConfig): void {
-  eventQueue = loadEventQueue()
+  eventQueue = loadEventQueue().filter(isV1Event)
   debugLog(config || { debug: false }, 'Event queue initialized', {
     eventCount: eventQueue.length,
   })
 }
 
-// Send events in batches
+/** Split events into EventBatch payloads of at most 50 events and 60 KB each. */
+export function buildBatchPayloads(config: AnalyticsConfig, events: AnalyticsEvent[]): string[] {
+  const envelope = (batch: AnalyticsEvent[]) =>
+    JSON.stringify({
+      v: 1,
+      siteKey: getSiteKey(config),
+      sentAt: new Date().toISOString(),
+      events: batch,
+    })
+  const overhead = utf8Length(envelope([]))
+
+  const payloads: string[] = []
+  let batch: AnalyticsEvent[] = []
+  let size = overhead
+  for (const event of events) {
+    const eventSize = utf8Length(JSON.stringify(event)) + 1
+    if (
+      batch.length > 0 &&
+      (batch.length >= MAX_EVENTS_PER_BATCH || size + eventSize > MAX_BATCH_BYTES)
+    ) {
+      payloads.push(envelope(batch))
+      batch = []
+      size = overhead
+    }
+    batch.push(event)
+    size += eventSize
+  }
+  if (batch.length > 0) payloads.push(envelope(batch))
+  return payloads
+}
+
+// Send all queued events (POST /v1/events), preferring sendBeacon
 export async function sendBatch(config: AnalyticsConfig): Promise<void> {
   if (!eventQueue.length) {
     debugLog(config, 'No events in queue to send')
     return
   }
 
-  const TRACK_URL = `${config.apiBaseUrl.replace(/\/$/, '')}/event`
-  debugLog(config, 'Sending batch to server', {
-    url: TRACK_URL,
-    eventCount: eventQueue.length,
-  })
-
-  // Get events to send
+  const url = eventsEndpoint(config)
   const eventsToSend = eventQueue.splice(0)
   saveEventQueue(eventQueue)
 
-  // Create unique ID for this batch
-  const batchId = generateObjectId()
-  const payload = JSON.stringify(eventsToSend)
+  let queuedForFetch = false
+  for (const payload of buildBatchPayloads(config, eventsToSend)) {
+    const batchId = generateObjectId()
+    const beaconSent =
+      typeof navigator !== 'undefined' &&
+      typeof navigator.sendBeacon === 'function' &&
+      navigator.sendBeacon(url, new Blob([payload], { type: BODY_CONTENT_TYPE }))
 
-  debugLog(config, 'Batch prepared', { batchId, payloadSize: payload.length })
-
-  // Try to use sendBeacon first
-  if (typeof navigator !== 'undefined' && navigator.sendBeacon) {
-    debugLog(config, 'Using sendBeacon for batch send')
-    const blob = new Blob([payload], { type: 'application/json' })
-    const sent = navigator.sendBeacon(TRACK_URL, blob)
-
-    if (sent) {
-      debugLog(config, 'Batch sent successfully via sendBeacon', { batchId })
+    if (beaconSent) {
+      debugLog(config, 'Batch sent via sendBeacon', { batchId, bytes: payload.length })
     } else {
-      debugLog(config, 'sendBeacon failed, queuing for retry', { batchId })
-      retryQueue.set(batchId, { payload, attempts: 0, id: batchId })
-      await retryFailedEvents(config)
+      // sendBeacon unavailable or refused (e.g. quota): deliver with fetch and retries.
+      retryQueue.set(batchId, { payload, attempts: 0, id: batchId, inFlight: false })
+      queuedForFetch = true
     }
-  } else {
-    debugLog(config, 'sendBeacon not available, using fetch')
-    // If sendBeacon is not available, use fetch with retry
-    retryQueue.set(batchId, { payload, attempts: 0, id: batchId })
-    await retryFailedEvents(config)
   }
+
+  if (queuedForFetch) await retryFailedEvents(config)
 }
 
-// Retry failed events
+// Retry failed events. Network errors, 408, 429 and 5xx are retried (up to maxRetries);
+// other 4xx responses are final. Retries are safe: the collector de-duplicates eventIds.
 export async function retryFailedEvents(config: AnalyticsConfig): Promise<void> {
-  const TRACK_URL = `${config.apiBaseUrl.replace(/\/$/, '')}/event`
+  const url = eventsEndpoint(config)
 
   for (const [id, item] of retryQueue.entries()) {
+    if (item.inFlight) continue
     if (item.attempts >= config.maxRetries) {
       retryQueue.delete(id)
       continue
     }
 
+    item.inFlight = true
     try {
-      const response = await fetch(TRACK_URL, {
+      const response = await fetch(url, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': BODY_CONTENT_TYPE },
         body: item.payload,
-        credentials: 'include',
+        credentials: 'omit',
+        keepalive: true,
       })
 
-      if (response.ok) {
+      const retryable = response.status === 408 || response.status === 429 || response.status >= 500
+      if (response.ok || !retryable) {
+        if (!response.ok) {
+          debugLog(config, 'Batch rejected by collector; not retrying', { status: response.status })
+        }
         retryQueue.delete(id)
       } else {
         item.attempts++
       }
     } catch {
       item.attempts++
+    } finally {
+      item.inFlight = false
     }
   }
 }
@@ -177,12 +238,8 @@ export function createTrackingContext(
     context.referrer = document.referrer
   }
 
-  if (typeof screen !== 'undefined') {
-    context.screenResolution = `${screen.width}x${screen.height}`
-  }
-
+  // Coarse buckets only: exact screen/viewport sizes add fingerprinting surface.
   if (typeof window !== 'undefined') {
-    context.viewport = `${window.innerWidth}x${window.innerHeight}`
     context.viewportBucket = getViewportBucket(window.innerWidth)
   }
 
@@ -209,50 +266,45 @@ export async function trackEvent(
   trackingContext?: TrackingContext,
   providedConsentStatus?: { consented: boolean | null; version: string | null },
 ): Promise<void> {
+  const requestedName = eventName
+  eventName = normalizeEventName(eventName)
+  if (eventName !== requestedName) {
+    debugLog(config, 'Event name normalized to match the contract', { requestedName, eventName })
+  }
   debugLog(config, 'Event tracking started', { eventName, eventProps })
 
-  // Get consent status - use provided status if available to avoid duplicate calls
-  const consentStatus = providedConsentStatus || (await getConsentStatus(config))
-  const hasExplicitConsent = consentStatus.consented === true
+  // Full first-party analytics needs the statistics category: allowed explicitly, or
+  // undecided where consent is not required. An explicit refusal is respected everywhere.
+  // (Callers may pass a decision, which then stands for statistics.)
   const consentRequired = isConsentRequired(config)
-  const trackingCategory = getTrackingCategory(hasExplicitConsent, consentRequired)
+  const statistics =
+    providedConsentStatus !== undefined
+      ? providedConsentStatus.consented
+      : getConsentCategories(config).statistics
+  const hasExplicitConsent = statistics === true
+  const trackingCategory: 'full' | 'limited' =
+    hasExplicitConsent || (statistics === null && !consentRequired) ? 'full' : 'limited'
 
-  debugLog(config, 'Consent and tracking info', {
-    hasExplicitConsent,
-    consentRequired,
-    trackingCategory,
-    consentStatus,
-  })
+  debugLog(config, 'Consent and tracking info', { statistics, consentRequired, trackingCategory })
 
-  // Check if we should track this event
+  // Some regions allow nothing at all without consent (policy trackingWithoutConsent).
+  if (
+    trackingCategory === 'limited' &&
+    consentRequired &&
+    getTrackingWithoutConsent(config) === 'none'
+  ) {
+    debugLog(config, 'Event not sent: nothing is tracked without consent here', { eventName })
+    return
+  }
+
+  // Without statistics consent only essential and anonymous events are sent.
   if (!shouldTrackEvent(eventName, trackingCategory, config)) {
-    debugLog(config, 'Event not tracked due to tracking rules', {
-      eventName,
-      trackingCategory,
-    })
-    // For non-essential events without consent in consent-required geos, check server consent
-    if (!hasExplicitConsent && consentRequired) {
-      // Reuse the consent status we already have instead of making another API call
-      const serverConsent = consentStatus.consented
-      if (!serverConsent) {
-        debugLog(config, 'Event blocked: no server consent', { eventName })
-        return
-      }
-      debugLog(config, 'Server consent granted, proceeding with event', {
-        eventName,
-      })
-    } else {
-      debugLog(config, 'Event blocked: no explicit consent and consent not required', { eventName })
-      return
-    }
+    debugLog(config, 'Event not tracked due to tracking rules', { eventName, trackingCategory })
+    return
   }
 
   // Create tracking context if not provided
-  const context =
-    trackingContext ||
-    (trackingCategory === 'none'
-      ? { sessionId: getOrCreateSessionId() }
-      : createTrackingContext(trackingCategory, hasExplicitConsent))
+  const context = trackingContext || createTrackingContext(trackingCategory, hasExplicitConsent)
 
   // Generate session ID based on tracking type
   let sessionId = context.sessionId
@@ -261,65 +313,64 @@ export async function trackEvent(
   }
 
   const payload: AnalyticsEvent = {
-    name: config.eventSiteName,
+    eventId: generateObjectId(),
+    name: eventName,
+    occurredAt: new Date().toISOString(),
     sessionId,
-    timestamp: new Date().toISOString(),
-    attributes: {
-      event: eventName,
-      eventData: { ...eventProps },
-      hasConsent: hasExplicitConsent,
-      consentRequired,
-      trackingCategory: trackingCategory as 'full' | 'limited',
-    },
+    trackingCategory: trackingCategory as 'full' | 'limited',
+    consent: { required: consentRequired, granted: hasExplicitConsent },
+    props: sanitizeEventUrls({ ...eventProps }, config.urlQueryAllowlist),
   }
 
   // Generate pageViewId for page_view events, reuse for related events
   if (eventName === 'page_view') {
     const pageViewId = generatePageViewId()
     setCurrentPageViewId(pageViewId)
-    payload.attributes.pageViewId = pageViewId
+    payload.pageViewId = pageViewId
   } else {
     // Include pageViewId in related events if available
     const pageViewId = getCurrentPageViewId()
     if (pageViewId) {
-      payload.attributes.pageViewId = pageViewId
+      payload.pageViewId = pageViewId
     }
   }
 
   if (trackingCategory === 'full') {
     // Full tracking: include all metadata
     if (context.userAgent) {
-      payload.attributes.eventData.userAgent = context.userAgent
+      payload.props.userAgent = context.userAgent
     }
     if (context.referrer) {
-      payload.attributes.eventData.referrer = context.referrer
-    }
-    if (context.screenResolution) {
-      payload.attributes.eventData.screenResolution = context.screenResolution
-    }
-    if (context.viewport) {
-      payload.attributes.eventData.viewport = context.viewport
+      payload.props.referrer = sanitizeUrl(context.referrer, {
+        allowQueryParams: [],
+      })
     }
     if (context.viewportBucket) {
-      payload.attributes.eventData.viewportBucket = context.viewportBucket
+      payload.props.viewportBucket = context.viewportBucket
     }
     if (context.deviceBucket) {
-      payload.attributes.eventData.deviceBucket = context.deviceBucket
+      payload.props.deviceBucket = context.deviceBucket
     }
     if (context.pageTitle) {
-      payload.attributes.eventData.pageTitle = context.pageTitle
-      payload.attributes.eventData.title = payload.attributes.eventData.title || context.pageTitle
+      payload.props.pageTitle = context.pageTitle
+      payload.props.title = payload.props.title || context.pageTitle
     }
     if (context.connectionType) {
-      payload.attributes.eventData.connectionType = context.connectionType
+      payload.props.connectionType = context.connectionType
     }
     if (context.locationContext) {
-      Object.assign(payload.attributes.eventData, context.locationContext)
+      Object.assign(payload.props, context.locationContext)
     }
   } else {
     // Limited tracking: only collect anonymous data
-    payload.attributes.eventData = createAnonymousEventData(payload.attributes.eventData)
-    payload.attributes.isAnonymous = true
+    payload.props = createAnonymousEventData(payload.props)
+  }
+
+  // Fit the event to the contract's limits so the collector does not reject it.
+  payload.props = fitPropsToContract(payload.props)
+  if (utf8Length(JSON.stringify(payload)) > MAX_EVENT_BYTES) {
+    debugLog(config, 'Event props too large; sending without props', { eventName })
+    payload.props = { propsTruncated: true }
   }
 
   eventQueue.push(payload)
@@ -327,7 +378,7 @@ export async function trackEvent(
 
   debugLog(config, 'Event queued', {
     eventName,
-    eventId: payload.attributes.pageViewId,
+    eventId: payload.pageViewId,
     queueLength: eventQueue.length,
   })
 

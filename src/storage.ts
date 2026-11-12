@@ -1,4 +1,5 @@
 // Storage utilities for analytics data
+import type { CategoryChoices } from './categories'
 import { resolveCookieDomain } from './cookie-domain'
 import { generateObjectId } from './core'
 import type { AttributionData, ConsentStatus, GeoContext } from './types'
@@ -74,11 +75,18 @@ export function getLocalConsentStatus(): ConsentStatus {
   return stored || { consented: null, version: null, timestamp: 0 }
 }
 
-export function setLocalConsentStatus(consented: boolean | null, version: string | null): void {
-  const data = {
+export function setLocalConsentStatus(
+  consented: boolean | null,
+  version: string | null,
+  consentId?: string,
+  categories?: CategoryChoices,
+): void {
+  const data: ConsentStatus = {
     consented,
     version,
     timestamp: Date.now(),
+    ...(consentId ? { consentId } : {}),
+    ...(categories ? { categories } : {}),
   }
   setStorageItem(STORAGE_KEYS.CONSENT_STATUS, data)
 }
@@ -156,15 +164,21 @@ export function setAttributionData(attributionData: AttributionData): void {
   setStorageItem(STORAGE_KEYS.ATTRIBUTION_CONTEXT, attributionData)
 }
 
-// GDPR: Clear attribution data when consent is withdrawn
-export function clearAttributionDataForGDPR(): void {
+// GDPR: Clear attribution data when consent is withdrawn (Art. 7(3), 17(1)(b)). Pass the
+// configured cookieDomain so a cross-subdomain attribution cookie is removed too.
+export function clearAttributionDataForGDPR(cookieDomain?: string): void {
   debugLog({ debug: false }, 'GDPR: Clearing attribution data due to consent withdrawal')
   removeStorageItem(STORAGE_KEYS.ATTRIBUTION_CONTEXT)
 
   if (typeof document !== 'undefined') {
     try {
       const clearCookie = (domain?: string | null) => {
-        const attributes = [`${STORAGE_KEYS.ATTRIBUTION_CONTEXT}=`, 'Max-Age=0', 'Path=/']
+        const attributes = [
+          `${STORAGE_KEYS.ATTRIBUTION_CONTEXT}=`,
+          'Max-Age=0',
+          'Expires=Thu, 01 Jan 1970 00:00:00 GMT',
+          'Path=/',
+        ]
         if (domain) {
           attributes.push(`Domain=${domain}`)
         }
@@ -174,7 +188,7 @@ export function clearAttributionDataForGDPR(): void {
       clearCookie()
 
       const hostname = typeof window !== 'undefined' ? window.location.hostname : undefined
-      const domain = resolveCookieDomain(hostname)
+      const domain = resolveCookieDomain(hostname, cookieDomain)
       if (domain) {
         clearCookie(domain)
       }
@@ -184,7 +198,7 @@ export function clearAttributionDataForGDPR(): void {
   }
 }
 
-// Clear all analytics storage (for GDPR compliance)
+// Clear all analytics storage (e.g. for a GDPR Art. 17 erasure request)
 export function clearAnalyticsStorage(): void {
   const keys = Object.values(STORAGE_KEYS)
   keys.forEach(key => {

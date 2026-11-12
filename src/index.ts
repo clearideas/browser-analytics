@@ -1,8 +1,23 @@
 // Main analytics module - exports the core functionality
 export * from './attribution'
+export type { BannerOptions } from './banner'
+export { CONSENT_SETTINGS_SELECTOR } from './banner'
 export * from './consent'
 export * from './core'
+export type { GatedScriptsOptions } from './gated-scripts'
 export * from './integrations'
+export { PluginHost } from './plugins/host'
+export type { IntegrationsConfig } from './plugins/registry'
+export type {
+  AnalyticsPlugin,
+  ConsentState,
+  CookieRule,
+  PluginConsentState,
+  PluginContext,
+  PluginEvent,
+  StorageRule,
+  WithdrawalMode,
+} from './plugins/types'
 export * from './storage'
 export * from './tracking'
 export * from './types'
@@ -12,165 +27,223 @@ import {
   captureInitialAttribution,
   cleanAttributionFromUrl,
   getAttributionContext,
+  readLandingAttribution,
   setAttributionCookie,
   updateAttributionLastSeen,
 } from './attribution'
-import { getConsent, getConsentStatus, setConsent as setConsentUtil } from './consent'
-import { resolveCookieDomain } from './cookie-domain'
+import {
+  CONSENT_SETTINGS_HASH,
+  CONSENT_SETTINGS_SELECTOR,
+  hideBanner,
+  hideManageButton,
+  isBannerVisible,
+  resolveBannerOptions,
+  showBanner,
+  showManageButton,
+} from './banner'
+import type { CategoryChoices } from './categories'
+import {
+  allCategories,
+  completeChoices,
+  isOptionalCategory,
+  OPTIONAL_CATEGORIES,
+} from './categories'
+import {
+  flushPendingConsentRecords,
+  getConsent,
+  getConsentCategories,
+  getConsentDecision,
+  getCurrentPolicyVersion,
+  isConsentRequired,
+  isGlobalPrivacyControlEnabled,
+  setConsent as setConsentUtil,
+} from './consent'
 import {
   getConnectionType,
   getDeviceBucket,
   getViewportBucket,
   normalizeOutboundLink,
   sanitizeAnalyticsText,
+  sanitizeEventUrls,
 } from './core'
-import {
-  initializeClearIdeasChat,
-  initializeGTag,
-  initializeOpenAIAdsPixel,
-  initializeUET,
-  trackIntegratedEvent,
-  trackUETConversion,
-  trackUETEvent,
-  updateChatConsent,
-} from './integrations'
+import { GatedScripts } from './gated-scripts'
+import { toThirdPartyEventParams, trackUETConversion, trackUETEvent } from './integrations'
+import { pageReloader } from './plugins/dom'
+import { PluginHost } from './plugins/host'
+import { resolvePluginSpecs } from './plugins/registry'
+import type { ConsentState } from './plugins/types'
+import { isCategoryAllowed } from './plugins/types'
 import {
   clearAttributionDataForGDPR,
   getGeoContext,
-  getLocalConsentStatus,
   isDontTrackOwnerEnabled,
   setDontTrackOwner,
   setGeoContext,
 } from './storage'
 import { flushEvents, initializeEventQueue, stopFlushTimer, trackEvent } from './tracking'
-import type { Analytics, AnalyticsConfig, FrameworkAdapter } from './types'
-import { debugLog } from './types'
-import { disableConsoleDebug, enableConsoleDebug, getConsoleDebugStatus } from './types'
+import type {
+  Analytics,
+  AnalyticsConfig,
+  ConsentApi,
+  ConsentSnapshot,
+  FrameworkAdapter,
+} from './types'
+import {
+  debugLog,
+  disableConsoleDebug,
+  enableConsoleDebug,
+  getConsoleDebugStatus,
+  getSiteKey,
+  STORAGE_KEYS,
+} from './types'
 
-// Session management with server API calls
-async function manageSession(config: AnalyticsConfig): Promise<void> {
+// Fetch the consent policy for this visitor (GET /v1/context) unless a fresh one is
+// cached for this browser session or was supplied with the page (initialContext).
+// On failure nothing is stored, so consent is treated as required.
+async function fetchContext(config: AnalyticsConfig): Promise<void> {
   if (typeof window === 'undefined') return
 
-  try {
-    const sessionData = localStorage.getItem('ci_session_status')
-    const now = Date.now()
-    let lastSessionCheck = 0
-
-    if (sessionData) {
-      try {
-        lastSessionCheck = JSON.parse(sessionData).timestamp || 0
-      } catch {
-        // Error parsing session data
-      }
-    }
-
-    // Only call session API if we haven't done so recently
-    if (!sessionData || now - lastSessionCheck > config.sessionCheckInterval) {
-      const SESSION_URL = `${config.apiBaseUrl.replace(/\/$/, '')}/event/session`
-
-      // Add timeout to session API call
-      const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), 5000) // 5 second timeout
-
-      try {
-        const response = await fetch(SESSION_URL, {
-          credentials: 'include',
-          signal: controller.signal,
-        })
-        clearTimeout(timeoutId)
-
-        if (response.ok) {
-          const data = await response.json()
-          // Update session timestamp and user info
-          localStorage.setItem(
-            'ci_session_status',
-            JSON.stringify({
-              timestamp: now,
-              userId: data.userId,
-            }),
-          )
-        } else {
-          debugLog(config, 'Session API failed', { status: response.status })
-        }
-      } catch (fetchError: any) {
-        clearTimeout(timeoutId)
-        if (fetchError.name === 'AbortError') {
-          debugLog(config, 'Session API timeout')
-        } else {
-          debugLog(config, 'Session API error', { error: fetchError.message })
-        }
-      }
-    }
-  } catch {
-    debugLog(config, 'Error managing session')
-  }
-}
-
-// Check if consent is required based on user's geo location
-function isConsentRequired(): boolean {
-  if (typeof window === 'undefined') return true // Default to requiring consent on server
-
-  try {
-    const geoData = getGeoContext()
-    if (geoData) {
-      const age = Date.now() - (geoData.timestamp || 0)
-      // Use cached geo data if less than 24 hours old
-      if (age < 24 * 60 * 60 * 1000) {
-        return geoData.requiresConsent === true
-      }
-    }
-  } catch {
-    // Ignore storage errors
-  }
-
-  return true // Default to requiring consent if unknown
-}
-
-// Fetch geo context from server
-async function fetchGeoContext(config: AnalyticsConfig): Promise<void> {
-  if (typeof window === 'undefined') return
-
-  try {
-    const geoResponse = await fetch(`${config.apiBaseUrl.replace(/\/$/, '')}/event/geo`, {
-      credentials: 'include',
-      headers: {
-        Accept: 'application/json',
-      },
+  if (config.initialContext) {
+    setGeoContext({
+      requiresConsent: config.initialContext.consentRequired === true,
+      policyVersion: config.initialContext.policyVersion,
+      trackingWithoutConsent: config.initialContext.trackingWithoutConsent,
+      country: config.initialContext.country,
+      continent: config.initialContext.continent,
     })
+    return
+  }
 
-    if (!geoResponse.ok) {
-      throw new Error('Geo API failed')
-    }
+  const cached = getGeoContext()
+  if (cached?.expiresAt && cached.expiresAt > Date.now()) {
+    debugLog(config, 'Using cached context')
+    return
+  }
 
-    const geoData = await geoResponse.json()
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), 5000)
+  try {
+    const url = `${config.apiBaseUrl.replace(/\/$/, '')}/v1/context?siteKey=${encodeURIComponent(
+      getSiteKey(config),
+    )}`
+    const response = await fetch(url, {
+      credentials: 'omit',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    })
+    if (!response.ok) throw new Error(`Context API failed: ${response.status}`)
 
-    // Store non-PII location data for client-side analytics use
-    if (geoData.country && geoData.continent) {
-      try {
-        setGeoContext({
-          country: geoData.country,
-          continent: geoData.continent,
-          requiresConsent: geoData.requiresConsent,
-          cached: geoData.cached,
-        })
-      } catch {
-        // Ignore storage errors - geo data will be refetched as needed
-      }
-    }
-  } catch {
-    debugLog(config, 'Error fetching geo context')
-    // Fallback: assume consent required for safety
+    const context = await response.json()
+    const ttlSeconds = Number(context?.ttlSeconds)
+    setGeoContext({
+      requiresConsent: context?.policy?.consentRequired !== false,
+      policyVersion:
+        typeof context?.policy?.policyVersion === 'string'
+          ? context.policy.policyVersion
+          : undefined,
+      trackingWithoutConsent:
+        context?.policy?.trackingWithoutConsent === 'none' ||
+        context?.policy?.trackingWithoutConsent === 'limited'
+          ? context.policy.trackingWithoutConsent
+          : undefined,
+      country: typeof context?.geo?.country === 'string' ? context.geo.country : undefined,
+      continent: typeof context?.geo?.continent === 'string' ? context.geo.continent : undefined,
+      expiresAt: Date.now() + (Number.isFinite(ttlSeconds) ? ttlSeconds : 3600) * 1000,
+    })
+  } catch (error) {
+    debugLog(config, 'Error fetching context; consent will be required', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  } finally {
+    clearTimeout(timeoutId)
   }
 }
 
 export function createAnalytics(config: AnalyticsConfig, adapter: FrameworkAdapter): Analytics {
+  return createAnalyticsInternal(config, adapter).analytics
+}
+
+function createAnalyticsInternal(config: AnalyticsConfig, adapter: FrameworkAdapter) {
   // Initialize event queue
 
   initializeEventQueue(config)
 
+  // Integrations run as plugins under the consent rules (see plugins/host.ts).
+  const plugins = new PluginHost(config, resolvePluginSpecs(config))
+  // Consent-gated <script type="text/plain" data-ci-consent> tags (see gated-scripts.ts).
+  const gatedScripts =
+    config.gatedScripts === false ? null : new GatedScripts(config, config.gatedScripts ?? {})
+  const bannerOptions = resolveBannerOptions(
+    config.banner === false ? undefined : config.banner,
+    config.websiteBaseUrl,
+  )
+  const consentListeners = new Set<(state: ConsentSnapshot) => void>()
+
+  const consentState = (): ConsentState => ({
+    required: isConsentRequired(config),
+    granted: getConsentDecision(config),
+    categories: getConsentCategories(config),
+    gpc: isGlobalPrivacyControlEnabled(config),
+  })
+  const categoriesMode = config.consent?.choices === 'categories'
+  const offeredCategories = (config.consent?.categories ?? [...OPTIONAL_CATEGORIES]).filter(
+    isOptionalCategory,
+  )
+
+  // Bring plugins and gated scripts in line with the current consent state (cheap when
+  // unchanged).
+  const syncPlugins = (): ConsentState => {
+    const state = consentState()
+    plugins.applyConsent(state)
+    gatedScripts?.apply(state)
+    return state
+  }
+
+  // Attribution present in the landing URL, held in memory only. It is persisted
+  // once storage is allowed (immediately, or when the visitor accepts the banner),
+  // even if they have navigated away from the landing page by then.
+  const landingAttribution = readLandingAttribution()
+
+  // Build and send one event. The caller's props are never mutated. URLs are sanitized
+  // for every destination; attribution enrichment goes to our backend only.
+  // Synchronous up to queueing: consent is read from the browser, no network round trip.
+  const dispatchEvent = (name: string, props: Record<string, any>): Promise<void> => {
+    const eventProps = sanitizeEventUrls({ ...props }, config.urlQueryAllowlist)
+    const backendProps: Record<string, any> = { ...eventProps }
+
+    // Add first-touch attribution (validated, known keys only) for our backend.
+    const attributionContext = getAttributionContext(config)
+    if (attributionContext) {
+      backendProps.attribution = attributionContext
+      for (const [key, value] of Object.entries(attributionContext)) {
+        if (typeof value !== 'string' || !value) continue
+        if (key.startsWith('utm_') || key.startsWith('ci_')) {
+          backendProps[key] = value
+        }
+      }
+      if (attributionContext.gclid) backendProps.gclid = attributionContext.gclid
+      if (attributionContext.msclkid) backendProps.msclkid = attributionContext.msclkid
+    }
+
+    // Our backend. The event is queued synchronously; only delivery is async.
+    const delivery = trackEvent(config, name, backendProps)
+
+    // Plugins receive the event's own parameters, not our enrichment; the host forwards
+    // it only to plugins the current consent state allows.
+    syncPlugins()
+    plugins.track({
+      name,
+      params: toThirdPartyEventParams(eventProps),
+      props: eventProps,
+      attribution: attributionContext ?? undefined,
+    })
+
+    return delivery
+  }
+
   // Track event wrapper
   const trackEventWrapper = async (name: string, props: Record<string, any> = {}) => {
-    debugLog(config, 'trackEventWrapper called', { eventName: name, props })
+    debugLog(config, 'trackEventWrapper called', { eventName: name })
 
     // Check if owner tracking is disabled
     if (isDontTrackOwnerEnabled()) {
@@ -180,47 +253,41 @@ export function createAnalytics(config: AnalyticsConfig, adapter: FrameworkAdapt
       return
     }
 
-    // Add attribution context to events (GDPR compliant)
-    // Attribution data includes UTM parameters from initial landing page
-    const attributionContext = getAttributionContext()
-    if (attributionContext) {
-      props.attribution = attributionContext
-      // Include all UTM/internal campaign variants directly in event data for easy access
-      for (const [key, value] of Object.entries(attributionContext)) {
-        if (typeof value !== 'string' || !value) continue
-        if (key.startsWith('utm_') || key.startsWith('ci_')) {
-          props[key] = value
-        }
-      }
-      if (attributionContext.gclid) props.gclid = attributionContext.gclid
-      if (attributionContext.msclkid) props.msclkid = attributionContext.msclkid
+    await dispatchEvent(name, props)
+  }
+
+  // For page-hide/unload handlers: the event is queued before the handler returns.
+  const trackEventNow = (name: string, props: Record<string, any> = {}) => {
+    if (isDontTrackOwnerEnabled()) return
+    void dispatchEvent(name, props)
+  }
+
+  // Persist landing attribution once storage is allowed (no consent required, or
+  // consent given), share it via cookie if configured, and tidy the visible URL.
+  const persistAttributionIfAllowed = () => {
+    if (typeof window === 'undefined') return
+
+    // Stored attribution is part of analytics: it needs the statistics category.
+    if (!isCategoryAllowed('statistics', consentState())) {
+      debugLog(config, 'GDPR: Skipping attribution capture - no statistics consent')
+      return
     }
 
-    debugLog(config, 'Sending event to main API', { eventName: name })
+    const attributionData = captureInitialAttribution(config, landingAttribution)
+    if (attributionData) {
+      if (config.cookieDomain) setAttributionCookie(attributionData, config.cookieDomain)
 
-    // Get consent status once and reuse it to avoid duplicate network calls
-    const consentStatus = await getConsentStatus(config)
-    const consentRequired = isConsentRequired()
-    const hasExplicitConsent = consentStatus.consented === true
-    const allowThirdPartyTracking = !consentRequired || hasExplicitConsent
+      if (config.cleanAttributionUrl !== false) {
+        const cleanUrl = cleanAttributionFromUrl()
+        if (cleanUrl !== window.location.href) {
+          // Keep the router's history.state (Vue Router stores navigation data there).
+          window.history.replaceState(window.history.state, '', cleanUrl)
+          debugLog(config, 'Cleaned attribution parameters from URL')
+        }
+      }
+    }
 
-    debugLog(config, 'Consent status for tracking', {
-      hasExplicitConsent,
-      consentRequired,
-      allowThirdPartyTracking,
-      consentStatus,
-    })
-
-    // Track with our system - pass consent status to avoid another lookup
-    await trackEvent(config, name, props, undefined, consentStatus)
-
-    // Track with integrated platforms
-    debugLog(config, 'Consent for integrated tracking', {
-      consent: allowThirdPartyTracking,
-      consentRequired,
-      hasExplicitConsent,
-    })
-    trackIntegratedEvent(config, name, props, allowThirdPartyTracking)
+    updateAttributionLastSeen()
   }
 
   // Error tracking wrapper
@@ -228,114 +295,157 @@ export function createAnalytics(config: AnalyticsConfig, adapter: FrameworkAdapt
     trackEventWrapper('error', { message, ...props })
   }
 
-  // Complete consent banner implementation
-  const showConsentBanner = () => {
-    // Check if banner already exists (avoid duplicates)
-    if (typeof document !== 'undefined' && document.getElementById('ci-consent-banner')) {
-      return
+  // --- Consent ---------------------------------------------------------------------
+
+  const consentSnapshot = (state: ConsentState = consentState()): ConsentSnapshot => ({
+    ...state,
+    policyVersion: getCurrentPolicyVersion(),
+  })
+
+  // "Cookie settings" button: lets visitors change their decision later.
+  const updateManageButton = () => {
+    if (config.banner === false) return
+    const setting = bannerOptions.manageButton
+    const state = consentState()
+    const decided = OPTIONAL_CATEGORIES.some(category => state.categories[category] !== null)
+    // A consent settings link on the page (e.g. in the footer) replaces the floating button.
+    const hasSettingsLink =
+      typeof document !== 'undefined' && document.querySelector(CONSENT_SETTINGS_SELECTOR) !== null
+    const show =
+      setting === true || (setting === 'auto' && state.required && decided && !hasSettingsLink)
+    if (show) showManageButton(bannerOptions, () => showConsentBanner({ focus: true }))
+    else hideManageButton()
+  }
+
+  /**
+   * Apply a decision. The decision is stored and every consumer (plugins, attribution,
+   * UI) is updated synchronously, before the consent record is sent, so no event reaches a
+   * third party under the previous state.
+   */
+  // Whether the banner should be on screen (shown and not yet answered).
+  let bannerWanted = false
+
+  const decide = async (choices: CategoryChoices, source: 'banner' | 'api') => {
+    debugLog(config, 'Consent decision', { choices, source })
+    const recording = setConsentUtil(config, choices, source)
+    bannerWanted = false
+    hideBanner()
+    const state = syncPlugins()
+    if (isCategoryAllowed('statistics', state)) {
+      // Storage is now allowed: persist the landing attribution held in memory.
+      persistAttributionIfAllowed()
+    } else {
+      // GDPR: Clear attribution data when consent is withdrawn
+      clearAttributionDataForGDPR(config.cookieDomain)
     }
+    updateManageButton()
+    notifyConsentListeners(state)
+    await recording
 
-    // Create wrapper div for Vuetify components
-    const banner = document.createElement('div')
-    banner.id = 'ci-consent-banner'
+    // A withdrawal that running third-party code cannot apply in place: reload, so the
+    // code is gone. The decision is already stored, so nothing that needs it starts again.
+    const pluginsNeedReload = plugins.takeReloadRequest()
+    const gatedNeedReload = gatedScripts?.takeReloadRequest() ?? false
+    if ((pluginsNeedReload || gatedNeedReload) && config.consent?.reloadOnWithdrawal !== false) {
+      debugLog(config, 'Reloading the page to complete the withdrawal')
+      pageReloader.reload()
+    }
+  }
 
-    // Apply Vuetify-like styles
-    banner.style.position = 'fixed'
-    banner.style.bottom = '0'
-    banner.style.left = '0'
-    banner.style.right = '0'
-    banner.style.zIndex = '1000'
-    banner.style.padding = '0'
-
-    let privacyPolicyUrl = '/privacy'
-    if (typeof config.websiteBaseUrl === 'string' && config.websiteBaseUrl.trim().length > 0) {
+  const notifyConsentListeners = (state: ConsentState = consentState()) => {
+    const snapshot = consentSnapshot(state)
+    for (const listener of consentListeners) {
       try {
-        const parsedBase =
-          typeof window !== 'undefined'
-            ? new URL(config.websiteBaseUrl, window.location.origin)
-            : new URL(config.websiteBaseUrl)
-        if (parsedBase.protocol === 'http:' || parsedBase.protocol === 'https:') {
-          const normalizedBase = parsedBase.href.endsWith('/')
-            ? parsedBase.href
-            : `${parsedBase.href}/`
-          privacyPolicyUrl = new URL('privacy', normalizedBase).href
-        }
-      } catch {
-        // Fall back to relative privacy URL for invalid or untrusted base URLs.
+        listener(snapshot)
+      } catch (error) {
+        debugLog(config, 'Consent listener failed', error)
       }
     }
-
-    // Set banner content with Vuetify classes
-    banner.innerHTML = `
-      <div class="v-sheet v-sheet--elevation-3" style="border-radius: 0; padding: 16px; background-color: rgb(var(--v-theme-surface));">
-        <div class="d-flex align-center justify-space-between flex-column flex-md-row" style="gap: 12px; max-width: 1600px; margin: 0 auto;">
-          <div class="flex-grow-1 flex-shrink-1 text-body-2">
-            <p class="font-weight-semibold mb-1">Help us improve your experience</p>
-            <p>We use cookies and similar technologies to keep our site secure, operate essential features, analyze traffic, and improve content and advertising. Select "Accept All" to allow every cookie, or choose "Reject non-essential" to permit only those required for the site to function. Learn more in our
-            <a href="${privacyPolicyUrl}" class="text-decoration-none font-weight-medium" style="color: rgb(var(--v-theme-primary));">Privacy Policy</a>.</p>
-          </div>
-          <div class="flex-grow-0 flex-shrink-0 d-flex gap-2 align-center justify-center justify-md-end">
-            <button id="ci-consent-reject" class="v-btn v-btn--density-default v-btn--size-default v-btn--variant-outlined v-btn--rounded text-primary text-capitalize">
-              <span class="v-btn__content">Reject non-essential</span>
-            </button>
-            <button id="ci-consent-accept" class="v-btn v-btn--density-default v-btn--size-default v-btn--variant-flat v-btn--rounded bg-primary text-on-primary text-capitalize">
-              <span class="v-btn__content">Accept All</span>
-            </button>
-          </div>
-        </div>
-      </div>
-    `
-
-    document.body.appendChild(banner)
-
-    // Add event listeners
-    const acceptBtn = document.getElementById('ci-consent-accept')
-    const rejectBtn = document.getElementById('ci-consent-reject')
-
-    if (acceptBtn) {
-      acceptBtn.addEventListener('click', async () => {
-        debugLog(config, 'Consent accepted - setting consent to true')
-        await setConsentUtil(config, true)
-        document.body.removeChild(banner)
-        // Initialize third-party tracking
-        initializeGTag(config, true)
-        initializeUET(config, true)
-        initializeOpenAIAdsPixel(config, true)
-        // Chat is initialized regardless of consent (functional service)
-        await initializeClearIdeasChat(config)
-        // Update chat widget consent state to reflect granted consent
-        updateChatConsent(config)
-      })
-    }
-
-    if (rejectBtn) {
-      rejectBtn.addEventListener('click', async () => {
-        debugLog(config, 'Consent rejected - setting consent to false')
-        await setConsentUtil(config, false)
-        document.body.removeChild(banner)
-
-        // GDPR: Clear attribution data when consent is withdrawn
-        clearAttributionDataForGDPR()
-
-        // Initialize third-party tracking without consent
-        initializeGTag(config, false)
-        initializeUET(config, false)
-        initializeOpenAIAdsPixel(config, false)
-        // Chat is still available (functional service, not tracking)
-        await initializeClearIdeasChat(config)
-        // Update chat widget consent state to reflect rejected consent
-        updateChatConsent(config)
-      })
-    }
   }
 
-  // Consent banner wrapper for backward compatibility
-  const showConsentBannerWrapper = () => {
-    showConsentBanner()
+  const showConsentBanner = ({ focus = false }: { focus?: boolean } = {}) => {
+    if (config.banner === false) {
+      debugLog(config, 'Built-in banner disabled (banner: false); use analytics.consent')
+      return
+    }
+    // Remember where the visitor came from before hiding anything: browsers move focus
+    // to <body> when the focused element (e.g. "Cookie settings") is hidden.
+    const opener =
+      typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null
+    hideManageButton()
+    bannerWanted = true
+    showBanner(
+      bannerOptions,
+      {
+        onAccept: () => void decide(allCategories(true), 'banner'),
+        onReject: () => void decide(allCategories(false), 'banner'),
+        onSave: choices => void decide(completeChoices(choices), 'banner'),
+      },
+      {
+        focus,
+        returnFocusTo: opener,
+        // Category choices, opened directly when the visitor asked for the settings.
+        categories: categoriesMode
+          ? { offered: offeredCategories, current: getConsentCategories(config), expanded: focus }
+          : undefined,
+      },
+    )
   }
 
-  // Auto-tracking functionality
+  // Readiness: initAnalytics marks the instance pending until the consent policy is known.
+  let ready: Promise<void> = Promise.resolve()
+  let resolveReady = () => {}
+  const beginInit = () => {
+    ready = new Promise<void>(resolve => (resolveReady = resolve))
+  }
+
+  const consent: ConsentApi = {
+    get: () => consentSnapshot(),
+    // Wait for the policy so the decision is recorded under the right policy version.
+    accept: async () => {
+      await ready
+      return decide(allCategories(true), 'api')
+    },
+    reject: async () => {
+      await ready
+      return decide(allCategories(false), 'api')
+    },
+    set: async choices => {
+      await ready
+      return decide(completeChoices(choices), 'api')
+    },
+    onChange: listener => {
+      consentListeners.add(listener)
+      return () => consentListeners.delete(listener)
+    },
+    showBanner: () => showConsentBanner({ focus: true }),
+  }
+
+  // Auto-tracking functionality. Everything registered here is recorded in
+  // `autoTrackingCleanup` so stopAutoTracking() can undo it and a second
+  // startAutoTracking() call is a no-op.
+  let autoTrackingCleanup: Array<() => void> | null = null
+
   const startAutoTracking = () => {
+    if (autoTrackingCleanup) {
+      debugLog(config, 'Auto-tracking already running')
+      return
+    }
+    const cleanup: Array<() => void> = []
+    autoTrackingCleanup = cleanup
+
+    const listen = (
+      target: EventTarget,
+      type: string,
+      handler: EventListener,
+      options?: AddEventListenerOptions,
+    ) => {
+      target.addEventListener(type, handler, options)
+      cleanup.push(() => target.removeEventListener(type, handler, options))
+    }
+
     debugLog(config, 'Starting auto-tracking')
     debugLog(config, 'Auto-tracking config', {
       autoTrackScrollDepth: config.autoTrackScrollDepth,
@@ -344,43 +454,7 @@ export function createAnalytics(config: AnalyticsConfig, adapter: FrameworkAdapt
     })
 
     // GDPR: Only capture attribution if consent not required OR consent provided
-    if (typeof window !== 'undefined') {
-      const consentRequired = isConsentRequired()
-      // Use cached local consent status (don't make network call during init)
-      const localConsent = getLocalConsentStatus()
-      const hasConsent = consentRequired ? localConsent.consented === true : true
-
-      debugLog(config, 'GDPR attribution check', {
-        consentRequired,
-        hasConsent,
-        localConsentStatus: localConsent.consented,
-        willCaptureAttribution: !consentRequired || hasConsent,
-      })
-
-      if (!consentRequired || hasConsent) {
-        const cleanUrl = cleanAttributionFromUrl()
-        const hasAttributionInCurrentUrl = cleanUrl !== window.location.href
-
-        // Consent given or not required - capture attribution
-        const attributionData = captureInitialAttribution(config)
-        if (attributionData) {
-          // Set attribution cookie for cross-subdomain access
-          const domainOverride = resolveCookieDomain(window.location.hostname)
-          setAttributionCookie(attributionData, domainOverride ?? undefined)
-
-          // Clean URL by removing attribution parameters
-          if (config.cleanAttributionUrl !== false && hasAttributionInCurrentUrl) {
-            window.history.replaceState({}, '', cleanUrl)
-            debugLog(config, 'Cleaned attribution parameters from URL')
-          }
-        }
-
-        // Update last seen timestamp for existing attribution
-        updateAttributionLastSeen()
-      } else {
-        debugLog(config, 'GDPR: Skipping attribution capture - consent not provided')
-      }
-    }
+    persistAttributionIfAllowed()
 
     // Clear Ideas Chat initialization is handled in consent management (see consent banner)
 
@@ -410,6 +484,15 @@ export function createAnalytics(config: AnalyticsConfig, adapter: FrameworkAdapt
       }
     }
 
+    // Context of the page currently being viewed, captured at its page_view. Exit
+    // events use this, because by the time a route change is reported the URL
+    // already points at the next page.
+    let currentPageContext = getPageContext()
+    // Page identity: the URL without attribution parameters, so removing utm_*/gclid from
+    // the address bar (history.replaceState) is not mistaken for a navigation.
+    const pageKey = (url: string) => cleanAttributionFromUrl(url)
+    let lastTrackedPage = pageKey(currentPageContext.url)
+
     const resetPageState = () => {
       pageStartTime = Date.now()
       pageExitTracked = false
@@ -419,56 +502,57 @@ export function createAnalytics(config: AnalyticsConfig, adapter: FrameworkAdapt
       keypressCount = 0
     }
 
-    const trackPageExit = (
-      pageContext = getPageContext(),
-      timeSpentSeconds = Math.round((Date.now() - pageStartTime) / 1000),
-      interactionState = {
-        clicks: clickCount,
-        keypresses: keypressCount,
-        maxScrollDepth,
-      },
-    ) => {
+    const trackPageExit = (track: (name: string, props: Record<string, any>) => unknown) => {
       if (pageExitTracked) return
       pageExitTracked = true
 
-      trackEventWrapper('page_exit', {
-        ...pageContext,
+      const timeSpentSeconds = Math.round((Date.now() - pageStartTime) / 1000)
+      track('page_exit', {
+        ...currentPageContext,
         timeSpent: timeSpentSeconds,
         timeSpentTotal: timeSpentSeconds,
-        clicks: interactionState.clicks,
-        keypresses: interactionState.keypresses,
-        maxScrollDepth: interactionState.maxScrollDepth,
-      })
-    }
-
-    const trackCurrentPageExit = () => {
-      trackPageExit()
-    }
-
-    // Track initial page view
-    const pageViewData = getPageContext()
-
-    debugLog(config, 'Sending initial page view', pageViewData)
-    trackEventWrapper('page_view', pageViewData)
-
-    // Set up route change tracking
-    adapter.onRouteChange((path: string) => {
-      debugLog(config, 'Route changed', { path })
-
-      const exitingPageContext = getPageContext()
-      const exitingTimeSpent = Math.round((Date.now() - pageStartTime) / 1000)
-      const exitingInteractionState = {
         clicks: clickCount,
         keypresses: keypressCount,
         maxScrollDepth,
-      }
+      })
+    }
 
-      trackPageExit(exitingPageContext, exitingTimeSpent, exitingInteractionState)
-      resetPageState()
+    // Work to do when the page is hidden or unloaded. Handlers must queue events
+    // synchronously (trackEventNow); the queue is then sent with sendBeacon before the
+    // handler returns, because the browser may discard the page right afterwards.
+    const pageHiddenHandlers: Array<() => void> = []
+    const handlePageHidden = () => {
+      for (const handler of pageHiddenHandlers) handler()
+      void flushEvents(config)
+    }
+    if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+      listen(document, 'visibilitychange', () => {
+        if (document.visibilityState === 'hidden') handlePageHidden()
+      })
+      listen(window, 'pagehide', handlePageHidden)
+    }
+
+    // Track initial page view
+    debugLog(config, 'Sending initial page view', currentPageContext)
+    trackEventWrapper('page_view', currentPageContext)
+
+    // Set up route change tracking
+    const unsubscribeRouteChange = adapter.onRouteChange((path: string) => {
       const nextPageContext = getPageContext()
+      if (pageKey(nextPageContext.url) === lastTrackedPage) {
+        debugLog(config, 'Route change to the current URL ignored', { path })
+        return
+      }
+      debugLog(config, 'Route changed', { path })
+
+      trackPageExit(trackEventWrapper)
+      resetPageState()
+      currentPageContext = nextPageContext
+      lastTrackedPage = pageKey(nextPageContext.url)
       debugLog(config, 'Sending route page view', nextPageContext)
       trackEventWrapper('page_view', nextPageContext)
     })
+    cleanup.push(() => unsubscribeRouteChange?.())
 
     // Auto-track scroll depth if enabled
     if (config.autoTrackScrollDepth && typeof window !== 'undefined') {
@@ -507,7 +591,10 @@ export function createAnalytics(config: AnalyticsConfig, adapter: FrameworkAdapt
         }, throttleDelay)
       }
 
-      window.addEventListener('scroll', trackScrollDepth, { passive: true })
+      listen(window, 'scroll', trackScrollDepth, { passive: true })
+      cleanup.push(() => {
+        if (throttleTimer !== null) window.clearTimeout(throttleTimer)
+      })
     }
 
     // Auto-track time spent if enabled
@@ -518,30 +605,25 @@ export function createAnalytics(config: AnalyticsConfig, adapter: FrameworkAdapt
         const timeSpent = Math.round((Date.now() - pageStartTime) / 1000)
         if (timeSpent >= 30) {
           // Track after 30 seconds
-          trackEventWrapper('time_spent', {
+          trackEventNow('time_spent', {
             duration: timeSpent,
             timeSpent,
             clicks: clickCount,
             keypresses: keypressCount,
             maxScrollDepth,
-            ...getPageContext(),
+            ...currentPageContext,
           })
           timeSpentTracked = true
         }
       }
 
-      // Track time spent on visibility change (tab switch, minimize, etc.)
-      document.addEventListener('visibilitychange', () => {
-        if (document.hidden) {
-          trackTimeSpent()
-        } else {
-          // Reset timer when returning to page
-          timeSpentTracked = false
-        }
-      })
+      // Tab switch, minimize, close, navigation away
+      pageHiddenHandlers.push(trackTimeSpent)
 
-      // Track on page unload
-      window.addEventListener('beforeunload', trackTimeSpent)
+      // Reset when returning to the page
+      listen(document, 'visibilitychange', () => {
+        if (document.visibilityState === 'visible') timeSpentTracked = false
+      })
     }
 
     // Auto-track outbound links if enabled
@@ -574,40 +656,35 @@ export function createAnalytics(config: AnalyticsConfig, adapter: FrameworkAdapt
         })
       }
 
-      document.addEventListener('click', handleOutboundLink)
+      listen(document, 'click', handleOutboundLink)
     }
 
     if (typeof document !== 'undefined') {
-      document.addEventListener('click', () => {
+      listen(document, 'click', () => {
         clickCount += 1
       })
 
-      document.addEventListener('keydown', (event: KeyboardEvent) => {
-        if (event.metaKey || event.ctrlKey || event.altKey) return
+      listen(document, 'keydown', event => {
+        const keyEvent = event as KeyboardEvent
+        if (keyEvent.metaKey || keyEvent.ctrlKey || keyEvent.altKey) return
         keypressCount += 1
       })
     }
 
-    // Auto-track page exit
-    if (typeof window !== 'undefined' && typeof document !== 'undefined') {
-      // Track on page unload (user closes tab, navigates away, etc.)
-      window.addEventListener('beforeunload', trackCurrentPageExit)
-
-      // Also track on page visibility change to hidden (tab switch, minimize)
-      if (typeof document !== 'undefined') {
-        document.addEventListener('visibilitychange', () => {
-          if (document.hidden) {
-            trackCurrentPageExit()
-          }
-        })
-      }
-    }
+    // Auto-track page exit when the page is hidden or unloaded
+    pageHiddenHandlers.push(() => trackPageExit(trackEventNow))
 
     // Auto-track web vitals
     if (typeof window !== 'undefined' && typeof PerformanceObserver !== 'undefined') {
+      const observe = (entryTypes: string[], callback: PerformanceObserverCallback) => {
+        const observer = new PerformanceObserver(callback)
+        observer.observe({ entryTypes })
+        cleanup.push(() => observer.disconnect())
+      }
+
       // Track Largest Contentful Paint (LCP)
       try {
-        const lcpObserver = new PerformanceObserver(list => {
+        observe(['largest-contentful-paint'], list => {
           const entries = list.getEntries()
           const lastEntry = entries[entries.length - 1]
           if (lastEntry) {
@@ -618,16 +695,14 @@ export function createAnalytics(config: AnalyticsConfig, adapter: FrameworkAdapt
             })
           }
         })
-        lcpObserver.observe({ entryTypes: ['largest-contentful-paint'] })
       } catch {
         debugLog(config, 'LCP observer not supported')
       }
 
       // Track First Input Delay (FID)
       try {
-        const fidObserver = new PerformanceObserver(list => {
-          const entries = list.getEntries()
-          entries.forEach((entry: any) => {
+        observe(['first-input'], list => {
+          list.getEntries().forEach((entry: any) => {
             trackEventWrapper('web_vital', {
               name: 'FID',
               value: Math.round(entry.processingStart - entry.startTime),
@@ -635,7 +710,6 @@ export function createAnalytics(config: AnalyticsConfig, adapter: FrameworkAdapt
             })
           })
         })
-        fidObserver.observe({ entryTypes: ['first-input'] })
       } catch {
         debugLog(config, 'FID observer not supported')
       }
@@ -643,44 +717,32 @@ export function createAnalytics(config: AnalyticsConfig, adapter: FrameworkAdapt
       // Track Cumulative Layout Shift (CLS)
       try {
         let clsValue = 0
-        const clsObserver = new PerformanceObserver(list => {
-          const entries = list.getEntries()
-          entries.forEach((entry: any) => {
+        observe(['layout-shift'], list => {
+          list.getEntries().forEach((entry: any) => {
             if (!entry.hadRecentInput) {
               clsValue += entry.value
             }
           })
         })
-        clsObserver.observe({ entryTypes: ['layout-shift'] })
 
-        // Report CLS on page visibility change or before unload
-        const reportCLS = () => {
+        // Report CLS when the page is hidden or unloaded
+        pageHiddenHandlers.push(() => {
           if (clsValue > 0) {
-            trackEventWrapper('web_vital', {
+            trackEventNow('web_vital', {
               name: 'CLS',
               value: Math.round(clsValue * 1000) / 1000, // Round to 3 decimal places
-              ...getPageContext(),
+              ...currentPageContext,
             })
           }
-        }
-
-        if (typeof document !== 'undefined') {
-          document.addEventListener('visibilitychange', () => {
-            if (document.hidden) {
-              reportCLS()
-            }
-          })
-        }
-        window.addEventListener('beforeunload', reportCLS)
+        })
       } catch {
         debugLog(config, 'CLS observer not supported')
       }
 
       // Track First Contentful Paint (FCP)
       try {
-        const fcpObserver = new PerformanceObserver(list => {
-          const entries = list.getEntries()
-          entries.forEach((entry: any) => {
+        observe(['paint'], list => {
+          list.getEntries().forEach((entry: any) => {
             trackEventWrapper('web_vital', {
               name: 'FCP',
               value: Math.round(entry.startTime),
@@ -688,16 +750,14 @@ export function createAnalytics(config: AnalyticsConfig, adapter: FrameworkAdapt
             })
           })
         })
-        fcpObserver.observe({ entryTypes: ['paint'] })
       } catch {
         debugLog(config, 'FCP observer not supported')
       }
 
       // Track Time to First Byte (TTFB)
       try {
-        const navigationObserver = new PerformanceObserver(list => {
-          const entries = list.getEntries()
-          entries.forEach((entry: any) => {
+        observe(['navigation'], list => {
+          list.getEntries().forEach((entry: any) => {
             const ttfb = entry.responseStart - entry.requestStart
             if (ttfb > 0) {
               trackEventWrapper('web_vital', {
@@ -708,7 +768,6 @@ export function createAnalytics(config: AnalyticsConfig, adapter: FrameworkAdapt
             }
           })
         })
-        navigationObserver.observe({ entryTypes: ['navigation'] })
       } catch {
         debugLog(config, 'TTFB observer not supported')
       }
@@ -750,36 +809,9 @@ export function createAnalytics(config: AnalyticsConfig, adapter: FrameworkAdapt
           }
         }
 
-        // Track viewport and screen information
-        if (typeof screen !== 'undefined') {
-          metrics.screenWidth = screen.width
-          metrics.screenHeight = screen.height
-          metrics.colorDepth = screen.colorDepth
-          metrics.pixelRatio = window.devicePixelRatio || 1
-          metrics.viewportWidth = window.innerWidth
-          metrics.viewportHeight = window.innerHeight
-        }
-
-        // Track network information if available
-        if ('connection' in navigator) {
-          const connection = (navigator as any).connection
-          if (connection) {
-            metrics.connectionType = connection.effectiveType
-            metrics.downlink = connection.downlink
-            metrics.rtt = connection.rtt
-            metrics.saveData = connection.saveData
-          }
-        }
-
-        // Track memory information if available (Chrome only)
-        if ('memory' in performance) {
-          const memory = (performance as any).memory
-          if (memory) {
-            metrics.jsHeapSizeLimit = memory.jsHeapSizeLimit
-            metrics.totalJSHeapSize = memory.totalJSHeapSize
-            metrics.usedJSHeapSize = memory.usedJSHeapSize
-          }
-        }
+        // Deliberately not collected (fingerprinting surface): exact screen and viewport
+        // sizes, color depth, pixel ratio, JS heap sizes, network downlink/RTT. The page
+        // context already carries coarse viewport/device buckets and connection type.
 
         // Track resource loading metrics
         const resources = performance.getEntriesByType('resource') as PerformanceResourceTiming[]
@@ -806,14 +838,14 @@ export function createAnalytics(config: AnalyticsConfig, adapter: FrameworkAdapt
 
       // Track metrics when DOM is ready
       if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', trackPageLoadMetrics)
+        listen(document, 'DOMContentLoaded', trackPageLoadMetrics)
       } else {
         // DOM is already ready
         trackPageLoadMetrics()
       }
 
       // Track metrics on page load complete
-      window.addEventListener('load', () => {
+      listen(window, 'load', () => {
         // Additional load-time metrics - send as a separate event since it happens later
         setTimeout(() => {
           const metrics: Record<string, any> = {
@@ -839,29 +871,68 @@ export function createAnalytics(config: AnalyticsConfig, adapter: FrameworkAdapt
     }
 
     debugLog(config, 'Auto-tracking fully initialized')
-
-    // Handle session management asynchronously (don't block tracking)
-    if (typeof window !== 'undefined') {
-      manageSession(config)
-    }
   }
 
   const stopAutoTracking = () => {
-    // Note: Cleanup would need to be implemented to properly remove event listeners
-    // For now, this is a placeholder
+    if (!autoTrackingCleanup) return
+    for (const undo of autoTrackingCleanup.splice(0)) {
+      try {
+        undo()
+      } catch {
+        // Keep cleaning up even if one step fails
+      }
+    }
+    autoTrackingCleanup = null
     debugLog(config, 'Auto-tracking stopped')
   }
 
-  return {
+  const analytics: Analytics = {
     trackEvent: trackEventWrapper,
     trackError: trackErrorWrapper,
     trackUETEvent,
     trackUETConversion,
     flush: () => flushEvents(config),
     getConsentStatus: () => getConsent(config),
-    showConsentBanner: showConsentBannerWrapper,
+    showConsentBanner: () => showConsentBanner(),
     startAutoTracking,
     stopAutoTracking,
+    consent,
+    ready: () => ready,
+  }
+
+  // Frameworks that replace the page body on navigation (e.g. Astro view transitions)
+  // remove the consent UI; put back what should be there.
+  const restoreConsentUi = () => {
+    if (config.banner === false || typeof document === 'undefined') return
+    if (bannerWanted && !isBannerVisible()) {
+      bannerWanted = false
+      showConsentBanner()
+    } else if (!bannerWanted) {
+      updateManageButton()
+    }
+  }
+
+  // Consent settings links (e.g. "Cookie settings" in the footer) reopen the banner.
+  const openSettingsFromLink = (event: Event) => {
+    const target = event.target as Element | null
+    if (!target?.closest?.(CONSENT_SETTINGS_SELECTOR)) return
+    if (config.banner === false) return
+    event.preventDefault()
+    showConsentBanner({ focus: true })
+  }
+
+  return {
+    analytics,
+    plugins,
+    gatedScripts,
+    openSettingsFromLink,
+    restoreConsentUi,
+    syncPlugins,
+    updateManageButton,
+    bannerOptions,
+    notifyConsentListeners,
+    beginInit,
+    endInit: () => resolveReady(),
   }
 }
 
@@ -872,8 +943,8 @@ export function getDontTrackOwnerStatus(): {
 } {
   const enabled = isDontTrackOwnerEnabled()
   const instructions = enabled
-    ? 'To enable tracking again, run: enableOwnerTracking()'
-    : 'To disable tracking, run: disableOwnerTracking()'
+    ? 'To enable tracking again, run: ciAnalytics.enableOwnerTracking()'
+    : 'To disable tracking, run: ciAnalytics.disableOwnerTracking()'
 
   return { enabled, instructions }
 }
@@ -883,46 +954,57 @@ export function useAttributionContext() {
   return getAttributionContext()
 }
 
-// Global function exposure for development and debugging
-function exposeGlobalFunctions(analytics: Analytics) {
-  if (typeof window !== 'undefined') {
-    // Owner tracking management - available globally for website owners
-    ;(window as any).disableOwnerTracking = () => {
+/** Helpers exposed as `window.ciAnalytics` when `exposeGlobals` or `debug` is enabled. */
+export interface AnalyticsGlobals {
+  instance: Analytics
+  disableOwnerTracking: () => ReturnType<typeof getDontTrackOwnerStatus>
+  enableOwnerTracking: () => ReturnType<typeof getDontTrackOwnerStatus>
+  ownerTrackingStatus: () => ReturnType<typeof getDontTrackOwnerStatus>
+  showCookieBanner: () => void
+  getAttributionContext: () => ReturnType<typeof getAttributionContext>
+  enableDebug: () => ReturnType<typeof getConsoleDebugStatus>
+  disableDebug: () => ReturnType<typeof getConsoleDebugStatus>
+  debugStatus: () => ReturnType<typeof getConsoleDebugStatus>
+}
+
+// Console helpers for site owners and developers. Opt-in: nothing is added to `window`
+// unless `exposeGlobals` or `debug` is set, and only one namespaced global is used so
+// other libraries (e.g. Segment's `window.analytics`) are never overwritten.
+function exposeGlobalFunctions(analytics: Analytics, config: AnalyticsConfig) {
+  if (typeof window === 'undefined') return
+  if (config.exposeGlobals !== true && config.debug !== true) return
+
+  const globals: AnalyticsGlobals = {
+    instance: analytics,
+    // Owner tracking management - lets site owners exclude their own visits
+    disableOwnerTracking: () => {
       setDontTrackOwner(true)
       debugLog({ debug: true }, 'Owner tracking disabled. Your visits will not be tracked.')
       return getDontTrackOwnerStatus()
-    }
-    ;(window as any).enableOwnerTracking = () => {
+    },
+    enableOwnerTracking: () => {
       setDontTrackOwner(false)
       debugLog({ debug: true }, 'Owner tracking enabled. Your visits will be tracked normally.')
       return getDontTrackOwnerStatus()
-    }
-    ;(window as any).ownerTrackingStatus = () => {
+    },
+    ownerTrackingStatus: () => {
       const status = getDontTrackOwnerStatus()
       debugLog({ debug: true }, `Owner tracking is ${status.enabled ? 'DISABLED' : 'ENABLED'}`)
       debugLog({ debug: true }, status.instructions)
       return status
-    }
-
-    // Analytics instance for debugging
-    ;(window as any).analytics = analytics
-
-    // Show cookie banner function for testing
-    ;(window as any).showCookieBanner = () => analytics.showConsentBanner()
-
-    // Attribution context accessor
-    ;(window as any).getAttributionContext = () => getAttributionContext()
-
-    // Debug logging management - available globally for developers
-    ;(window as any).enableDebug = () => {
+    },
+    showCookieBanner: () => analytics.showConsentBanner(),
+    getAttributionContext: () => getAttributionContext(config),
+    // Debug logging management
+    enableDebug: () => {
       enableConsoleDebug()
       return getConsoleDebugStatus()
-    }
-    ;(window as any).disableDebug = () => {
+    },
+    disableDebug: () => {
       disableConsoleDebug()
       return getConsoleDebugStatus()
-    }
-    ;(window as any).debugStatus = () => {
+    },
+    debugStatus: () => {
       const status = getConsoleDebugStatus()
       debugLog(
         { debug: true },
@@ -931,70 +1013,114 @@ function exposeGlobalFunctions(analytics: Analytics) {
       debugLog(
         { debug: true },
         `To ${status.enabled ? 'disable' : 'enable'} debug logging, run: ${
-          status.enabled ? 'disableDebug()' : 'enableDebug()'
+          status.enabled ? 'ciAnalytics.disableDebug()' : 'ciAnalytics.enableDebug()'
         }`,
       )
       return status
-    }
+    },
   }
+
+  ;(window as any).ciAnalytics = globals
 }
 
 // Initialize analytics with framework adapter
 export function initAnalytics(config: AnalyticsConfig, adapter: FrameworkAdapter): Analytics {
-  const analytics = createAnalytics(config, adapter)
+  const internal = createAnalyticsInternal(config, adapter)
+  const { analytics } = internal
+  if (typeof window !== 'undefined') internal.beginInit()
+
+  const initialize = async () => {
+    // Pre-v1 versions stored a server user ID here; it is no longer used.
+    try {
+      localStorage.removeItem(STORAGE_KEYS.SESSION_STATUS)
+    } catch {
+      // Ignore storage errors
+    }
+    // Deliver consent records that failed to send on an earlier visit.
+    void flushPendingConsentRecords(config)
+
+    // Fetch the consent policy for this visitor. On failure consent is required.
+    await fetchContext(config)
+
+    // Start the integrations this visitor's consent state allows (chat is functional
+    // and starts regardless; tags that need consent wait for it).
+    const state = internal.syncPlugins()
+    debugLog(config, 'Consent state', state)
+    // The consent situation is now known (policy from the collector).
+    internal.notifyConsentListeners(state)
+
+    const undecided = state.required && state.granted === null
+    if (undecided && config.banner !== false && internal.bannerOptions.autoShow) {
+      analytics.showConsentBanner()
+    } else if (window.location.hash === CONSENT_SETTINGS_HASH) {
+      // Arrived through a settings link (e.g. clicked before this script had loaded).
+      analytics.consent.showBanner()
+    } else if (!undecided) {
+      internal.updateManageButton()
+    }
+
+    // Essential and anonymous tracking runs in every case; what is collected depends on
+    // the consent state (see shouldTrackEvent).
+    analytics.startAutoTracking()
+  }
 
   // Set up framework-specific initialization
   adapter.onAppReady(async () => {
     debugLog(config, 'Analytics initialized')
-
-    // Fetch geo context to determine consent requirements
-    if (typeof window !== 'undefined') {
-      try {
-        await fetchGeoContext(config)
-
-        if (isConsentRequired()) {
-          const { consented } = await getConsentStatus(config)
-          if (consented === null) {
-            analytics.showConsentBanner()
-            // Still initialize analytics for essential/anonymous tracking
-            analytics.startAutoTracking()
-            // Chat is available regardless of consent (functional service)
-            await initializeClearIdeasChat(config)
-          } else {
-            // User has made a consent choice - initialize third-party services only if allowed.
-            const hasConsent = consented === true
-            initializeGTag(config, hasConsent)
-            initializeUET(config, hasConsent)
-            initializeOpenAIAdsPixel(config, hasConsent)
-            await initializeClearIdeasChat(config)
-            analytics.startAutoTracking()
-          }
-        } else {
-          // Consent not required - initialize third-party services
-          initializeGTag(config, true)
-          initializeUET(config, true)
-          initializeOpenAIAdsPixel(config, true)
-          await initializeClearIdeasChat(config)
-          analytics.startAutoTracking()
-        }
-      } catch {
-        // Fallback: assume consent required for safety
-        debugLog(config, 'Error during initialization, showing consent banner')
-        analytics.showConsentBanner()
-        analytics.startAutoTracking()
-        // Chat is available regardless of consent (functional service)
-        await initializeClearIdeasChat(config)
-      }
+    if (typeof window === 'undefined') return
+    try {
+      await initialize()
+    } finally {
+      internal.endInit()
     }
   })
 
+  // Keep the consent UI in place across navigations that replace the page body.
+  adapter.onRouteChange(() => internal.restoreConsentUi())
+
+  // Consent settings links anywhere on the page (capture phase: before routers that
+  // handle link clicks themselves).
+  if (typeof document !== 'undefined') {
+    document.addEventListener('click', internal.openSettingsFromLink, true)
+  }
+
+  // Vue/React layouts can mount their footer after policy initialization, and
+  // replace it after route changes. React only to settings-link presence changes
+  // so rendering our own floating button cannot create an observer loop.
+  let settingsLinksObserver: MutationObserver | undefined
+  if (
+    config.banner !== false &&
+    internal.bannerOptions.manageButton === 'auto' &&
+    typeof document !== 'undefined' &&
+    document.documentElement &&
+    typeof MutationObserver !== 'undefined'
+  ) {
+    let hadSettingsLink = document.querySelector(CONSENT_SETTINGS_SELECTOR) !== null
+    settingsLinksObserver = new MutationObserver(() => {
+      const hasSettingsLink = document.querySelector(CONSENT_SETTINGS_SELECTOR) !== null
+      if (hasSettingsLink === hadSettingsLink) return
+      hadSettingsLink = hasSettingsLink
+      internal.restoreConsentUi()
+    })
+    settingsLinksObserver.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['href', 'class', 'data-ci-consent-settings'],
+    })
+  }
+
   // Clean up on app destroy
   adapter.onAppDestroy(() => {
+    settingsLinksObserver?.disconnect()
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('click', internal.openSettingsFromLink, true)
+    }
     stopFlushTimer()
   })
 
-  // Expose global functions for development
-  exposeGlobalFunctions(analytics)
+  // Expose console helpers (opt-in)
+  exposeGlobalFunctions(analytics, config)
 
   return analytics
 }

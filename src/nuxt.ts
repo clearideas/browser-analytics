@@ -1,5 +1,5 @@
 // Nuxt wrapper for the shared analytics core
-import { DEFAULT_CONFIG, getConsentBannerHTML } from './core'
+import { DEFAULT_CONFIG } from './core'
 import { initAnalytics } from './index'
 import type { AnalyticsConfig } from './types'
 import { debugLog } from './types'
@@ -20,6 +20,116 @@ function parseNumberConfig(value: number | string | undefined): number | undefin
   return undefined
 }
 
+// Accept an object or a JSON string (env-friendly) for object options
+function parseObjectConfig(value: unknown): Record<string, unknown> | undefined {
+  if (value && typeof value === 'object' && !Array.isArray(value))
+    return value as Record<string, unknown>
+  if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value)
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : undefined
+    } catch {
+      console.warn('[Analytics] Ignoring invalid JSON in Nuxt analytics config')
+    }
+  }
+  return undefined
+}
+
+// Accept either an array or a comma-separated string (env-friendly) for list options
+function parseListConfig(value: unknown): string[] | undefined {
+  const items = Array.isArray(value)
+    ? value.map(item => String(item).trim())
+    : typeof value === 'string'
+      ? value.split(',').map(item => item.trim())
+      : []
+  const filtered = items.filter(Boolean)
+  return filtered.length > 0 ? filtered : undefined
+}
+
+/** Map Nuxt public runtime config (runtimeConfig.public) to the analytics config. */
+export function nuxtAnalyticsConfig(config: Record<string, any>): AnalyticsConfig {
+  return {
+    apiBaseUrl: (config.apiBaseUrl as string) || DEFAULT_CONFIG.apiBaseUrl,
+    siteKey: (config.analyticsSiteKey as string | undefined) || undefined,
+    eventSiteName: (config.eventSiteName as string) || 'nuxt-app', // fallback site key
+    gaMeasurementId: config.gaMeasurementId as string | undefined,
+    googleAdsConversions: config.googleAdsConversions as Record<string, string> | undefined,
+    openAIAdsPixelId: config.openAIAdsPixelId as string | undefined,
+    openAIAdsEvents: config.openAIAdsEvents as Record<string, any> | undefined,
+    openAIAdsDebug: config.openAIAdsDebug === true,
+    microsoftAdsTagId: config.microsoftAdsTagId as string | undefined,
+    chatAccessKey: config.chatAccessKey as string | undefined,
+    chatApiBaseUrl: config.chatApiBaseUrl as string | undefined,
+    chatOpenOnLoad:
+      config.chatOpenOnLoad === true || config.chatOpenOnLoad === false
+        ? config.chatOpenOnLoad
+        : undefined,
+    chatPosition: config.chatPosition as
+      'bottom-right' | 'bottom-left' | 'top-right' | 'top-left' | undefined,
+    chatWidth: parseNumberConfig(config.chatWidth as number | string | undefined),
+    chatHeight: parseNumberConfig(config.chatHeight as number | string | undefined),
+    chatTop: parseNumberConfig(config.chatTop as number | string | undefined),
+    chatRight: parseNumberConfig(config.chatRight as number | string | undefined),
+    chatBottom: parseNumberConfig(config.chatBottom as number | string | undefined),
+    chatLeft: parseNumberConfig(config.chatLeft as number | string | undefined),
+    chatDarkMode:
+      config.chatDarkMode === true || config.chatDarkMode === false
+        ? config.chatDarkMode
+        : undefined,
+    chatFabSize: parseNumberConfig(config.chatFabSize as number | string | undefined),
+    chatFabHide:
+      config.chatFabHide === true || config.chatFabHide === false ? config.chatFabHide : undefined,
+    chatEnabled: config.chatEnabled !== false,
+    chatWidgetUrl: config.chatWidgetUrl as string | undefined,
+    chatWidgetCssUrl: config.chatWidgetCssUrl as string | undefined,
+    chatUserName: config.chatUserName as string | undefined,
+    chatUserEmail: config.chatUserEmail as string | undefined,
+    chatUserId: config.chatUserId as string | undefined,
+    chatContainer: config.chatContainer as string | undefined,
+    chatConsentRequired:
+      config.chatConsentRequired === true || config.chatConsentRequired === false
+        ? config.chatConsentRequired
+        : undefined,
+    chatConsentGranted:
+      config.chatConsentGranted === true || config.chatConsentGranted === false
+        ? config.chatConsentGranted
+        : undefined,
+    microsoftAdsGoals: (config.microsoftAdsGoals as Record<string, string>) || {},
+    flushInterval: Number(config.analyticsFlushInterval) || DEFAULT_CONFIG.flushInterval,
+    consentCheckInterval:
+      Number(config.analyticsConsentCheckInterval) || DEFAULT_CONFIG.consentCheckInterval,
+    sessionCheckInterval:
+      Number(config.analyticsSessionCheckInterval) || DEFAULT_CONFIG.sessionCheckInterval,
+    batchSize: Number(config.analyticsBatchSize) || DEFAULT_CONFIG.batchSize,
+    maxRetries: Number(config.analyticsMaxRetries) || DEFAULT_CONFIG.maxRetries,
+    autoTrackScrollDepth: config.analyticsTrackScrollDepth !== false,
+    autoTrackTimeSpent: config.analyticsTrackTimeSpent !== false,
+    autoTrackOutboundLinks: config.analyticsTrackOutboundLinks !== false,
+    cleanAttributionUrl: config.analyticsCleanAttributionUrl !== false,
+    cookieDomain: (config.analyticsCookieDomain as string | undefined) || undefined,
+    urlQueryAllowlist: parseListConfig(config.analyticsUrlQueryAllowlist),
+    exposeGlobals: config.analyticsExposeGlobals === true,
+    integrations: parseObjectConfig(
+      config.analyticsIntegrations,
+    ) as AnalyticsConfig['integrations'],
+    banner:
+      config.analyticsBanner === false
+        ? false
+        : (parseObjectConfig(config.analyticsBanner) as AnalyticsConfig['banner']),
+    respectGlobalPrivacyControl: config.analyticsRespectGpc !== false,
+    // How consent is asked (choices, categories, trackingWithoutConsent, reloadOnWithdrawal).
+    consent: parseObjectConfig(config.analyticsConsent) as AnalyticsConfig['consent'],
+    // Consent-gated <script> tags: false to turn off, or options (nonce, allowedOrigins).
+    gatedScripts:
+      config.analyticsGatedScripts === false
+        ? false
+        : (parseObjectConfig(config.analyticsGatedScripts) as AnalyticsConfig['gatedScripts']),
+    debug: config.analyticsDebug === true,
+    nodeEnv: config.nodeEnv as string | undefined,
+    websiteBaseUrl: config.websiteBaseUrl as string | undefined,
+  }
+}
+
 // Note: This plugin should be imported as a client-only plugin in consuming projects
 // Export as a client-only plugin with graceful error handling for missing Nuxt dependency
 export default async (nuxtApp: any) => {
@@ -30,69 +140,7 @@ export default async (nuxtApp: any) => {
     // Get runtime config directly using Nuxt composables
     const config = useRuntimeConfig().public
 
-    const analyticsConfig: AnalyticsConfig = {
-      apiBaseUrl: (config.apiBaseUrl as string) || DEFAULT_CONFIG.apiBaseUrl,
-      eventSiteName: (config.eventSiteName as string) || 'nuxt-app',
-      gaMeasurementId: config.gaMeasurementId as string | undefined,
-      googleAdsConversions: config.googleAdsConversions as Record<string, string> | undefined,
-      openAIAdsPixelId: config.openAIAdsPixelId as string | undefined,
-      openAIAdsEvents: config.openAIAdsEvents as Record<string, any> | undefined,
-      openAIAdsDebug: config.openAIAdsDebug === true,
-      microsoftAdsTagId: config.microsoftAdsTagId as string | undefined,
-      chatAccessKey: config.chatAccessKey as string | undefined,
-      chatApiBaseUrl: config.chatApiBaseUrl as string | undefined,
-      chatOpenOnLoad:
-        config.chatOpenOnLoad === true || config.chatOpenOnLoad === false
-          ? config.chatOpenOnLoad
-          : undefined,
-      chatPosition: config.chatPosition as
-        'bottom-right' | 'bottom-left' | 'top-right' | 'top-left' | undefined,
-      chatWidth: parseNumberConfig(config.chatWidth as number | string | undefined),
-      chatHeight: parseNumberConfig(config.chatHeight as number | string | undefined),
-      chatTop: parseNumberConfig(config.chatTop as number | string | undefined),
-      chatRight: parseNumberConfig(config.chatRight as number | string | undefined),
-      chatBottom: parseNumberConfig(config.chatBottom as number | string | undefined),
-      chatLeft: parseNumberConfig(config.chatLeft as number | string | undefined),
-      chatDarkMode:
-        config.chatDarkMode === true || config.chatDarkMode === false
-          ? config.chatDarkMode
-          : undefined,
-      chatFabSize: parseNumberConfig(config.chatFabSize as number | string | undefined),
-      chatFabHide:
-        config.chatFabHide === true || config.chatFabHide === false
-          ? config.chatFabHide
-          : undefined,
-      chatEnabled: config.chatEnabled !== false,
-      chatWidgetUrl: config.chatWidgetUrl as string | undefined,
-      chatWidgetCssUrl: config.chatWidgetCssUrl as string | undefined,
-      chatUserName: config.chatUserName as string | undefined,
-      chatUserEmail: config.chatUserEmail as string | undefined,
-      chatUserId: config.chatUserId as string | undefined,
-      chatContainer: config.chatContainer as string | undefined,
-      chatConsentRequired:
-        config.chatConsentRequired === true || config.chatConsentRequired === false
-          ? config.chatConsentRequired
-          : undefined,
-      chatConsentGranted:
-        config.chatConsentGranted === true || config.chatConsentGranted === false
-          ? config.chatConsentGranted
-          : undefined,
-      microsoftAdsGoals: (config.microsoftAdsGoals as Record<string, string>) || {},
-      flushInterval: Number(config.analyticsFlushInterval) || DEFAULT_CONFIG.flushInterval,
-      consentCheckInterval:
-        Number(config.analyticsConsentCheckInterval) || DEFAULT_CONFIG.consentCheckInterval,
-      sessionCheckInterval:
-        Number(config.analyticsSessionCheckInterval) || DEFAULT_CONFIG.sessionCheckInterval,
-      batchSize: Number(config.analyticsBatchSize) || DEFAULT_CONFIG.batchSize,
-      maxRetries: Number(config.analyticsMaxRetries) || DEFAULT_CONFIG.maxRetries,
-      autoTrackScrollDepth: config.analyticsTrackScrollDepth !== false,
-      autoTrackTimeSpent: config.analyticsTrackTimeSpent !== false,
-      autoTrackOutboundLinks: config.analyticsTrackOutboundLinks !== false,
-      cleanAttributionUrl: config.analyticsCleanAttributionUrl !== false,
-      debug: config.analyticsDebug === true,
-      nodeEnv: config.nodeEnv as string | undefined,
-      websiteBaseUrl: config.websiteBaseUrl as string | undefined,
-    }
+    const analyticsConfig = nuxtAnalyticsConfig(config)
 
     // Debug logging for configuration loading
     if (analyticsConfig.debug) {
@@ -181,70 +229,6 @@ export default async (nuxtApp: any) => {
         nuxtApp.hook('app:mounted', callback)
       },
       onAppDestroy: () => () => {},
-      showConsentBanner: (onAccept: () => void, onReject: () => void) => {
-        debugLog(analyticsConfig, 'showConsentBanner called')
-
-        // Consent banner implementation - only run on client-side
-        if (typeof window === 'undefined' || typeof document === 'undefined') {
-          debugLog(analyticsConfig, 'Cannot show banner: window or document not available')
-          return
-        }
-
-        // Check if body exists
-        if (!document.body) {
-          debugLog(analyticsConfig, 'Cannot show banner: document.body not available')
-          return
-        }
-
-        if (document.getElementById('ci-consent-banner')) {
-          debugLog(analyticsConfig, 'Banner already exists, skipping')
-          return
-        }
-
-        try {
-          debugLog(analyticsConfig, 'Creating consent banner')
-
-          const banner = document.createElement('div')
-          banner.id = 'ci-consent-banner'
-          banner.style.position = 'fixed'
-          banner.style.bottom = '0'
-          banner.style.left = '0'
-          banner.style.right = '0'
-          banner.style.zIndex = '1000'
-          banner.style.padding = '0'
-          banner.innerHTML = getConsentBannerHTML(config.websiteBaseUrl as string)
-
-          document.body.appendChild(banner)
-          debugLog(analyticsConfig, 'Consent banner added to DOM')
-
-          const acceptBtn = document.getElementById('ci-consent-accept')
-          const rejectBtn = document.getElementById('ci-consent-reject')
-
-          if (acceptBtn) {
-            acceptBtn.addEventListener('click', () => {
-              debugLog(analyticsConfig, 'Consent accepted')
-              document.body.removeChild(banner)
-              onAccept()
-            })
-          } else {
-            console.warn(`🔍 [Analytics] Accept button not found`)
-          }
-
-          if (rejectBtn) {
-            rejectBtn.addEventListener('click', () => {
-              debugLog(analyticsConfig, 'Consent rejected')
-              document.body.removeChild(banner)
-              onReject()
-            })
-          } else {
-            console.warn(`🔍 [Analytics] Reject button not found`)
-          }
-
-          debugLog(analyticsConfig, 'Consent banner setup complete')
-        } catch (error) {
-          console.error(`🔍 [Analytics] Error creating consent banner:`, error)
-        }
-      },
       getRouter: () => null,
     }
 
@@ -255,13 +239,8 @@ export default async (nuxtApp: any) => {
 
     debugLog(analyticsConfig, 'Analytics instance created and provided to Nuxt')
 
-    // DEBUG: Consent banner testing is now available via window.showCookieBanner()
-    // Removed forced banner display to prevent interfering with geo-based consent logic
-
-    // Expose globally for development
-    if (typeof window !== 'undefined') {
-      ;(window as any).analytics = analytics
-    }
+    // Console helpers (window.ciAnalytics) are opt-in via analyticsExposeGlobals/analyticsDebug.
+    // window.analytics is intentionally not set (it belongs to other tools, e.g. Segment).
   } catch {
     console.warn('🔍 [Analytics] Nuxt not available - analytics disabled')
     // Plugin failed to load due to missing Nuxt dependency
