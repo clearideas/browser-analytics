@@ -25,8 +25,12 @@ const router = createRouter({
   ],
 })
 
-// Configuration comes from VITE_* variables (.env).
-initViteAnalytics(router)
+// Environment overrides are optional; the checked-in demo must also work in a
+// clean checkout without a developer's ignored .env file.
+initViteAnalytics(router, {
+  apiBaseUrl: import.meta.env.VITE_API_BASE_URL || 'http://localhost:18787/',
+  siteKey: import.meta.env.VITE_ANALYTICS_SITE_KEY || 'demo-site',
+})
 
 // The footer link reopens the consent banner, so visitors can change their decision.
 const Footer = () =>
