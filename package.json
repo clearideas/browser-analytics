@@ -19,7 +19,7 @@
     },
     "./nuxt.client": {
       "types": "./dist/nuxt.d.ts",
-      "import": "./dist/nuxt.mjs",
+      "import": "./dist/nuxt.client.mjs",
       "require": "./dist/nuxt.cjs"
     },
     "./vite": {
