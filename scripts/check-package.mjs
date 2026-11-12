@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -69,11 +70,32 @@ try {
       `Credential-shaped content in ${path}; matched value withheld`,
     );
   }
-  if (manifest.name === "@clearideas/chat") {
+  // React/Next entries must stay client modules for the Next.js App Router.
+  for (const entry of ["dist/react.mjs", "dist/next.mjs", "dist/react.cjs", "dist/next.cjs"]) {
     assert(
-      paths.has("dist/THIRD_PARTY_NOTICES.txt"),
-      "Bundled third-party notices are missing",
+      readFileSync(join(root, entry), "utf8").startsWith("'use client';"),
+      `${entry} must start with 'use client'`,
     );
+  }
+  // The script-tag build has no module imports; its plugins are separate files loaded with
+  // Subresource Integrity. Every built-in plugin has a file, and the hash built into
+  // analytics.js matches the packed file exactly.
+  const script = readFileSync(join(root, "dist/analytics.js"), "utf8");
+  assert(!/\bimport\s*\(|\brequire\(/.test(script), "dist/analytics.js must be self-contained");
+  const builtIns = [
+    ...readFileSync("src/plugins/loader-types.ts", "utf8")
+      .match(/BUILT_IN_PLUGINS = \[([^\]]*)\]/)[1]
+      .matchAll(/'([A-Za-z]+)'/g),
+  ].map((match) => match[1]);
+  assert(builtIns.length >= 10, "could not read BUILT_IN_PLUGINS");
+  for (const name of builtIns) {
+    const entry = script.match(new RegExp(`${name}:\\["([^"]+)","(sha384-[^"]+)"\\]`));
+    assert(entry, `dist/analytics.js has no plugin file for ${name}`);
+    const [, fileName, integrity] = entry;
+    const path = `dist/script-plugins/${fileName}`;
+    assert(paths.has(path), `Missing packed plugin file: ${path}`);
+    const digest = createHash("sha384").update(readFileSync(join(root, path))).digest("base64");
+    assert.equal(`sha384-${digest}`, integrity, `Integrity mismatch for ${path}`);
   }
   // Exercise the actual extracted tarball, not the development source tree.
   execFileSync(
@@ -89,9 +111,20 @@ try {
     const manifest = JSON.parse((await import('node:fs')).readFileSync(root + '/package.json', 'utf8'));
     const esm = await import(pathToFileURL(root + '/' + manifest.module));
     const cjs = createRequire(import.meta.url)(root + '/' + manifest.main);
-    const symbol = manifest.name.endsWith('/analytics') ? 'createAnalytics' : 'init';
+    const symbol = 'createAnalytics';
     assert.equal(typeof esm[symbol], 'function');
     assert.equal(typeof cjs[symbol], 'function');
+    // Built-in plugins are a separate entry and lazily loaded chunks.
+    const pluginsEntry = manifest.exports['./plugins'];
+    const esmPlugins = await import(pathToFileURL(root + '/' + pluginsEntry.import.replace('./', '')));
+    const cjsPlugins = createRequire(import.meta.url)(root + '/' + pluginsEntry.require.replace('./', ''));
+    for (const factory of ['googleAnalytics', 'microsoftUet', 'openAIAds', 'clearIdeasChat',
+      'hubspot', 'intercom', 'metaPixel', 'linkedInInsight', 'microsoftClarity', 'hotjar']) {
+      assert.equal(typeof esmPlugins[factory], 'function', factory);
+      assert.equal(typeof cjsPlugins[factory], 'function', factory);
+    }
+    const browser = await import(pathToFileURL(root + '/dist/browser.mjs'));
+    assert.equal(typeof browser.initBrowserAnalytics, 'function');
   `,
       root,
     ],

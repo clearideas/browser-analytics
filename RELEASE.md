@@ -22,3 +22,21 @@ Consumers can install a pinned public npm version or serve selected built files 
 ## First public release
 
 Use a reviewed source snapshot or a reviewed and sanitized history. Replacing an example key in current files does not remove historical copies or revoke that key. Verify that any previously embedded key is revoked or intentionally public and adequately restricted before publishing the old history. Keep private configuration, environment files, source-control metadata and generated release archives out of the public export.
+
+## Prerelease integration
+
+The prepared version is `0.1.0-rc.1`, published with the `next` tag. Stable releases
+use `latest`; a prerelease must not move that tag. Install the exact version in
+consumers until the production API and browser checks pass.
+
+The release workflow uses npm trusted publishing (OIDC), with no publish token.
+Configure the package's trusted publisher for the final Clear Ideas repository name
+and `publish.yml`, allowing direct publish, before enabling `NPM_RELEASES_ENABLED`.
+The GitHub repository name and package metadata must match that configuration.
+If the package does not yet exist, the organization owner must complete the initial
+package setup/publication using npm's supported interactive authentication, then
+configure trusted publishing for later releases. See
+https://docs.npmjs.com/trusted-publishers/.
+
+AI review is optional and runs only with `AI_REVIEW_ENABLED=true`; clean installs,
+builds and tests need only public npm dependencies and no Clear Ideas credentials.

@@ -16,4 +16,4 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           registry-url: https://registry.npmjs.org/
-      - run: npm install @clearideas/analytics
+      - run: npm install @clearideas/consent-analytics

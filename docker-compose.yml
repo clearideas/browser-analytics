@@ -1,0 +1,18 @@
+# Runs the reference collector. Edit sample-host/sites.example.json (or mount your own)
+# to register your sites. Behind Cloudflare, the country header is trusted below;
+# only trust headers your proxy sets, or clients can choose their own consent policy.
+services:
+  collector:
+    build:
+      context: .
+      dockerfile: sample-host/Dockerfile
+    ports:
+      - '8787:8787'
+    environment:
+      SITES_FILE: /config/sites.json
+      TRUSTED_GEO_HEADERS: cf-ipcountry
+    volumes:
+      - ./sample-host/sites.example.json:/config/sites.json:ro
+      - collector-data:/data
+volumes:
+  collector-data: {}

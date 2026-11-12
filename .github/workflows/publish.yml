@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   publish:
@@ -16,7 +17,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-          cache: npm
           registry-url: https://registry.npmjs.org/
       - name: Verify release tag
         env:
@@ -27,8 +27,10 @@ jobs:
           NPM_RELEASE_AGE_DAYS: '3'
         run: node scripts/check-npm-release-age.mjs
       - run: npm ci
+      - run: npm ci
+        working-directory: sample-host
       - run: npm run check
       - name: Publish public package
-        run: npm publish --access public --ignore-scripts
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
+        run: |
+          TAG=$(node -p "require('./package.json').version.includes('-') ? 'next' : 'latest'")
+          npm publish --access public --tag "$TAG" --ignore-scripts

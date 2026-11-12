@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Analytics Playground</title>
+    <link rel="stylesheet" href="/assets/style.css" />
+  </head>
+  <body>
+    <header class="top">
+      <div>
+        <h1>Analytics Playground</h1>
+        <p class="sub">
+          A fake website running <code>@clearideas/consent-analytics</code> against the sample collector.
+          Everything on the right is what actually left the browser.
+        </p>
+      </div>
+      <div id="status" class="status" aria-live="polite"></div>
+    </header>
+
+    <main class="grid">
+      <section class="panel site" aria-label="Demo website">
+        <nav class="site-nav" aria-label="Demo site navigation">
+          <a href="/" data-nav>Home</a>
+          <a href="/pricing" data-nav>Pricing</a>
+          <a href="/docs" data-nav>Docs</a>
+          <a href="https://example.org/" target="_blank" rel="noopener" data-testid="outbound">example.org ↗</a>
+        </nav>
+        <div id="page" class="page"></div>
+
+        <div class="reset" role="group" aria-label="Reset">
+          <span class="label">Reset</span>
+          <button id="reset-consent" title="Forget this visitor's consent decision; the banner appears again">Reset consent</button>
+          <button id="reset-visitor" title="Clear all ci_* storage and cookies in this browser (a brand-new visitor)">Reset visitor</button>
+          <button id="reset-all" class="danger" title="Reset visitor, clear server data and the region override">Reset everything</button>
+        </div>
+
+        <h2>1. Visitor</h2>
+        <div class="row" role="group" aria-label="Visitor region">
+          <span class="label">Region</span>
+          <button data-region="DE" data-continent="EU">Germany</button>
+          <button data-region="GB" data-continent="EU">United Kingdom</button>
+          <button data-region="US" data-continent="NA">United States</button>
+          <button data-region="">Unknown</button>
+        </div>
+        <div class="row">
+          <label class="toggle"><input type="checkbox" id="gpc" /> Browser sends Global Privacy Control</label>
+        </div>
+
+        <h2>Consent settings</h2>
+        <div class="row">
+          <label class="toggle"><input type="checkbox" id="categories-mode" /> Consent choices per category (Customize)</label>
+        </div>
+        <div class="row">
+          <label class="toggle"><input type="checkbox" id="no-tracking-without-consent" /> Nothing tracked without consent (collector policy)</label>
+        </div>
+        <div class="row">
+          <span class="label">Arrive</span>
+          <button id="from-ads">From a Google Ads click</button>
+          <button id="from-reset-link">Via a password-reset link</button>
+        </div>
+
+        <h2>2. Interact</h2>
+        <div class="row">
+          <button id="ev-signup">Track sign_up</button>
+          <button id="ev-purchase">Track purchase ($99)</button>
+          <button id="ev-custom">Track "Newsletter Signup"</button>
+          <button id="ev-error">Track error</button>
+        </div>
+        <div class="row">
+          <button id="manage-cookies">Cookie settings</button>
+          <button id="leave-page">Simulate leaving the page</button>
+          <button id="flush">Flush queue</button>
+        </div>
+
+        <h2>3. Operate</h2>
+        <div class="row">
+          <button id="new-policy">Publish new policy version</button>
+          <button id="reset-server">Clear server data</button>
+        </div>
+        <p class="hint" id="reset-note" aria-live="polite"></p>
+        <p class="hint">
+          Tip: switching to another browser tab also sends <code>page_exit</code>, exactly like a real visitor.
+        </p>
+        <p class="hint">
+          More demos: <a href="/plain/first">a plain site with only the script tag</a> ·
+          <a href="/tools/">third-party tools</a> (directory plugins, consent-gated scripts, a footer
+          "Cookie settings" link, under a strict Content Security Policy).
+        </p>
+      </section>
+
+      <section class="panel" aria-label="What left the browser">
+        <div class="tabs" role="tablist">
+          <button role="tab" data-tab="events" aria-selected="true">Collector: events <span id="count-events" class="pill">0</span></button>
+          <button role="tab" data-tab="consents" aria-selected="false">Collector: consent records <span id="count-consents" class="pill">0</span></button>
+          <button role="tab" data-tab="gtag" aria-selected="false">Google (gtag) <span id="count-gtag" class="pill">0</span></button>
+          <button role="tab" data-tab="storage" aria-selected="false">Browser storage</button>
+        </div>
+        <label class="filter"><input type="checkbox" id="hide-noise" checked /> Hide <code>web_vital</code> and <code>auto_metrics</code></label>
+        <ol id="tab-events" class="feed" data-testid="events"></ol>
+        <ol id="tab-consents" class="feed" hidden data-testid="consents"></ol>
+        <ol id="tab-gtag" class="feed" hidden data-testid="gtag"></ol>
+        <div id="tab-storage" class="storage" hidden data-testid="storage"></div>
+      </section>
+    </main>
+
+    <script src="/playground-config.js"></script>
+    <script type="module" src="/assets/app.js"></script>
+  </body>
+</html>

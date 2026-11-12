@@ -1,5 +1,5 @@
 // Core analytics utilities shared between frameworks
-import type { GeoContext } from './types'
+import type { AnalyticsConfig, GeoContext } from './types'
 import { STORAGE_KEYS } from './types'
 
 // Generate unique ObjectId-style identifier
@@ -28,29 +28,6 @@ export function generateObjectId(): string {
   return ts + rand
 }
 
-// Generate consent banner HTML (shared between frameworks)
-export function getConsentBannerHTML(websiteBaseUrl: string): string {
-  return `
-    <div class="v-sheet v-sheet--elevation-3" style="border-radius: 0; padding: 16px; background-color: rgb(var(--v-theme-surface));">
-      <div class="d-flex align-center justify-space-between flex-column flex-md-row" style="gap: 12px; max-width: 1600px; margin: 0 auto;">
-        <div class="flex-grow-1 flex-shrink-1 text-body-2">
-          <p class="font-weight-semibold mb-1">Help us improve your experience</p>
-          <p>We use cookies and similar technologies to keep our site secure, operate essential features, analyze traffic, and improve content and advertising. Select "Accept All" to allow every cookie, or choose "Reject non-essential" to permit only those required for the site to function. Learn more in our
-          <a href="${websiteBaseUrl}privacy" class="text-decoration-none font-weight-medium" style="color: rgb(var(--v-theme-primary));">Privacy Policy</a>.</p>
-        </div>
-        <div class="flex-grow-0 flex-shrink-0 d-flex gap-2 align-center justify-center justify-md-end">
-          <button id="ci-consent-reject" class="v-btn v-btn--density-default v-btn--size-default v-btn--variant-outlined v-btn--rounded text-primary text-capitalize">
-            <span class="v-btn__content">Reject non-essential</span>
-          </button>
-          <button id="ci-consent-accept" class="v-btn v-btn--density-default v-btn--size-default v-btn--variant-flat v-btn--rounded bg-primary text-on-primary text-capitalize">
-            <span class="v-btn__content">Accept All</span>
-          </button>
-        </div>
-      </div>
-    </div>
-  `
-}
-
 // Default configuration values (shared between frameworks)
 export const DEFAULT_CONFIG = {
   apiBaseUrl: '/api/',
@@ -67,6 +44,142 @@ export const DEFAULT_CONFIG = {
   autoTrackTimeSpent: true,
   autoTrackOutboundLinks: true,
 } as const
+
+/** The settings an integration must provide; everything else has a default. */
+export type AnalyticsOptions = Partial<AnalyticsConfig> & { apiBaseUrl: string; siteKey: string }
+
+/** Complete a partial configuration with the library defaults. */
+export function withDefaults(options: AnalyticsOptions): AnalyticsConfig {
+  return {
+    flushInterval: DEFAULT_CONFIG.flushInterval,
+    batchSize: DEFAULT_CONFIG.batchSize,
+    maxRetries: DEFAULT_CONFIG.maxRetries,
+    autoTrackScrollDepth: DEFAULT_CONFIG.autoTrackScrollDepth,
+    autoTrackTimeSpent: DEFAULT_CONFIG.autoTrackTimeSpent,
+    autoTrackOutboundLinks: DEFAULT_CONFIG.autoTrackOutboundLinks,
+    ...options,
+  }
+}
+
+// Query parameters that may remain in page URLs sent to analytics. Everything else
+// (reset/magic-link tokens, emails, session IDs, click IDs, search terms) is removed,
+// and fragments are always removed. Sites can allow more via `urlQueryAllowlist`.
+export const DEFAULT_URL_QUERY_ALLOWLIST: readonly string[] = [
+  'utm_source',
+  'utm_medium',
+  'utm_campaign',
+  'utm_term',
+  'utm_content',
+  'ci_source',
+  'ci_medium',
+  'ci_campaign',
+  'ci_term',
+  'ci_content',
+]
+
+/**
+ * Reduce a URL to what analytics may see: origin + path + allowed query parameters.
+ * Fragments and embedded credentials are always removed. Relative or unparseable
+ * input never returns anything after `?` or `#`; non-http(s) URLs return ''.
+ */
+export function sanitizeUrl(
+  url: string,
+  options: { allowQueryParams?: readonly string[] } = {},
+): string {
+  if (typeof url !== 'string' || !url) return ''
+  const allow = options.allowQueryParams ?? DEFAULT_URL_QUERY_ALLOWLIST
+
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return url.split(/[?#]/, 1)[0] ?? ''
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return ''
+
+  const kept = new URLSearchParams()
+  for (const [key, value] of parsed.searchParams) {
+    if (allow.includes(key)) kept.append(key, value)
+  }
+  const query = kept.toString()
+  return `${parsed.origin}${parsed.pathname}${query ? `?${query}` : ''}`
+}
+
+/**
+ * Apply the URL policy to the well-known URL fields of an event's properties, in place:
+ * `url` keeps allowed query parameters; `referrer` is reduced to origin + path.
+ */
+export function sanitizeEventUrls<T extends Record<string, any>>(
+  props: T,
+  extraAllowedQueryParams: readonly string[] = [],
+): T {
+  const record = props as Record<string, any>
+  if (typeof record.url === 'string') {
+    record.url = sanitizeUrl(record.url, {
+      allowQueryParams: [...DEFAULT_URL_QUERY_ALLOWLIST, ...extraAllowedQueryParams],
+    })
+  }
+  if (typeof record.referrer === 'string') {
+    record.referrer = sanitizeUrl(record.referrer, { allowQueryParams: [] })
+  }
+  return props
+}
+
+/**
+ * Event names must match ^[a-z][a-z0-9_]{0,63}$ (spec/openapi.yaml). Other names are
+ * normalized, e.g. "Sign Up" -> "sign_up", "404 seen" -> "event_404_seen".
+ */
+export function normalizeEventName(name: string): string {
+  let normalized = String(name)
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+  if (!normalized) return 'event'
+  if (!/^[a-z]/.test(normalized)) normalized = `event_${normalized}`
+  return normalized.slice(0, 64)
+}
+
+// Property limits from spec/openapi.yaml (Event.props / PropValue)
+const MAX_PROP_STRING = 2048
+const MAX_TOP_LEVEL_PROPS = 100
+const MAX_NESTED_PROPS = 50
+const MAX_ARRAY_ITEMS = 50
+const MAX_PROP_DEPTH = 6
+
+function fitPropValue(value: unknown, depth: number): unknown {
+  if (value === null || typeof value === 'boolean') return value
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  if (typeof value === 'string') return value.slice(0, MAX_PROP_STRING)
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value.toISOString()
+  if (depth >= MAX_PROP_DEPTH) return undefined
+  if (Array.isArray(value)) {
+    return value.slice(0, MAX_ARRAY_ITEMS).map(item => fitPropValue(item, depth + 1) ?? null)
+  }
+  if (typeof value === 'object') return fitPropObject(value as object, MAX_NESTED_PROPS, depth + 1)
+  return undefined // functions, symbols, bigint, undefined
+}
+
+function fitPropObject(value: object, maxKeys: number, depth: number): Record<string, unknown> {
+  const result: Record<string, unknown> = {}
+  let count = 0
+  for (const [key, item] of Object.entries(value)) {
+    if (count >= maxKeys) break
+    const fitted = fitPropValue(item, depth)
+    if (fitted !== undefined) {
+      result[key] = fitted
+      count++
+    }
+  }
+  return result
+}
+
+/**
+ * Make event props satisfy the contract's limits: at most 100 top-level and 50 nested
+ * keys, 50 array items, strings up to 2048 characters, JSON-compatible values only.
+ */
+export function fitPropsToContract(props: Record<string, any>): Record<string, any> {
+  return fitPropObject(props ?? {}, MAX_TOP_LEVEL_PROPS, 0)
+}
 
 // Extract UTM parameters from URL
 export function extractUtmParameters(url?: string): Record<string, string> {
@@ -155,7 +268,8 @@ export function getSafeLocationContext(): Record<string, any> {
   // Safe: broad geographic context (non-PII)
   if (typeof window !== 'undefined') {
     try {
-      const stored = localStorage.getItem(STORAGE_KEYS.GEO_CONTEXT)
+      // Written by setGeoContext (storage.ts) to sessionStorage.
+      const stored = sessionStorage.getItem(STORAGE_KEYS.GEO_CONTEXT)
       if (stored) {
         const geoData: GeoContext = JSON.parse(stored)
         const age = Date.now() - (geoData.timestamp || 0)
@@ -175,12 +289,7 @@ export function getSafeLocationContext(): Record<string, any> {
 
 // Sanitize URL for anonymous tracking
 export function sanitizeUrlForAnonymous(url: string): string {
-  try {
-    const urlObj = new URL(url)
-    return `${urlObj.protocol}//${urlObj.host}${urlObj.pathname}`
-  } catch {
-    return url
-  }
+  return sanitizeUrl(url, { allowQueryParams: [] })
 }
 
 export function getViewportBucket(width: number): string {
@@ -288,15 +397,17 @@ export function getAllowedAnonymousFields(): string[] {
     'deviceBucket',
     'connectionType',
     'outboundLink',
+    'message', // Error message (truncated in createAnonymousEventData)
     'name', // Web vital metric name
     'value', // Web vital metric value
     'timezone',
     'language',
     'country',
     'continent',
-    'userAgent',
   ]
 }
+
+const ANONYMOUS_MESSAGE_MAX_LENGTH = 500
 
 // Create anonymous event data
 export function createAnonymousEventData(eventData: Record<string, any>): Record<string, any> {
@@ -321,14 +432,19 @@ export function createAnonymousEventData(eventData: Record<string, any>): Record
   const safeLocationContext = getSafeLocationContext()
   Object.assign(anonymousData, safeLocationContext)
 
-  // Add userAgent for bot detection
-  if (typeof navigator !== 'undefined') {
-    anonymousData.userAgent = navigator.userAgent
-  }
+  // No user agent string here: it is high-entropy, and a collector that needs it for bot
+  // filtering receives it in the request's User-Agent header.
 
   // Sanitize URL
-  if (anonymousData.url) {
+  if (typeof anonymousData.url === 'string') {
     anonymousData.url = sanitizeUrlForAnonymous(anonymousData.url)
+  }
+
+  // Error messages are kept (errors are essential events) but bounded.
+  if ('message' in anonymousData) {
+    const message = sanitizeAnalyticsText(anonymousData.message, ANONYMOUS_MESSAGE_MAX_LENGTH)
+    if (message) anonymousData.message = message
+    else delete anonymousData.message
   }
 
   return anonymousData

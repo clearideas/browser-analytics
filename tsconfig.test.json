@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "allowImportingTsExtensions": true,
+    "types": ["vitest/globals", "node"]
+  },
+  "include": [
+    "src/**/*",
+    "test/**/*",
+    "e2e/**/*",
+    "sample-host/src/**/*",
+    "sample-host/test/**/*",
+    "vitest.config.ts",
+    "playwright.config.ts"
+  ],
+  "exclude": ["node_modules", "dist", "sample-host/node_modules"]
+}

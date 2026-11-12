@@ -3,8 +3,9 @@
 import fs from 'node:fs/promises'
 
 const minAgeDays = Number(process.env.NPM_RELEASE_AGE_DAYS ?? '3')
-const allowedScopes = new Set(['@awesome.me', '@clearideas', '@fortawesome'])
-const allowedHosts = new Set(['npm.fontawesome.com', 'registry.npmjs.org'])
+// Our own scope is exempt from the age gate so first-party releases can be consumed immediately.
+const exemptScopes = new Set(['@clearideas'])
+const PUBLIC_REGISTRY_HOST = 'registry.npmjs.org'
 const now = Date.now()
 const minAgeMs = minAgeDays * 24 * 60 * 60 * 1000
 
@@ -83,16 +84,23 @@ for (const [path, pkg] of packages) {
   const scope = scopeOf(name)
   const host = pkg.resolved ? hostOf(pkg.resolved) : null
 
-  if (allowedScopes.has(scope) || allowedHosts.has(host)) continue
+  if (exemptScopes.has(scope)) continue
+  // Bundled dependencies ship inside their parent's tarball, which is checked itself.
+  if (pkg.inBundle) continue
 
-  if (pkg.resolved?.startsWith('git+')) {
-    failures.push(`${name}@${pkg.version} resolves from git (${pkg.resolved})`)
+  // Every other dependency must come from the public registry and be age-checked.
+  // Anything else (git, tarball URLs, other registries, missing source) fails closed.
+  if (host !== PUBLIC_REGISTRY_HOST) {
+    failures.push(`${name}@${pkg.version} resolves from an unexpected source (${pkg.resolved ?? 'none'})`)
     continue
   }
 
-  if (host && host !== 'registry.npmjs.org') continue
-
   checks.push(() => checkPackage(name, pkg))
+}
+
+if (checks.length === 0 && failures.length === 0) {
+  console.error('No dependencies were age-checked; refusing to pass vacuously.')
+  process.exit(1)
 }
 
 for (let i = 0; i < checks.length; i += 8) {
@@ -100,9 +108,9 @@ for (let i = 0; i < checks.length; i += 8) {
 }
 
 if (failures.length) {
-  console.error(`Found npm packages newer than ${minAgeDays} days:`)
+  console.error(`Dependency age/source check failed (minimum age ${minAgeDays} days):`)
   for (const failure of failures) console.error(`- ${failure}`)
   process.exit(1)
 }
 
-console.log(`All public npm packages are at least ${minAgeDays} days old.`)
+console.log(`Checked ${checks.length} public npm packages: all are at least ${minAgeDays} days old.`)

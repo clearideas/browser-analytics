@@ -1,181 +1,190 @@
-// Consent management utilities
-import { isAnonymousTrackable, isEssentialEvent } from './core'
-import { getGeoContext, getLocalConsentStatus, setLocalConsentStatus } from './storage'
-import type { AnalyticsConfig } from './types'
-import { debugLog } from './types'
+// Consent management (v1 contract).
+//
+// The visitor's decision is stored in the browser (first-party localStorage) and is the
+// source of truth. The collector only receives append-only consent records (proof of
+// consent, GDPR Art. 7(1)) via POST /v1/consent. The consent *policy* (is consent
+// required, which policy version) comes from GET /v1/context and is cached by
+// storage.setGeoContext().
+import type { CategoryChoices, CategoryState } from './categories'
+import {
+  allCategories,
+  completeChoices,
+  decisionOf,
+  OPTIONAL_CATEGORIES,
+  UNDECIDED,
+} from './categories'
+import { generateObjectId, isAnonymousTrackable, isEssentialEvent } from './core'
+import {
+  getGeoContext,
+  getLocalConsentStatus,
+  getStorageItem,
+  setLocalConsentStatus,
+  setStorageItem,
+} from './storage'
+import type { AnalyticsConfig, ConsentRecord } from './types'
+import { debugLog, getSiteKey, STORAGE_KEYS } from './types'
 
-// Track ongoing consent API calls to prevent duplicates
-let ongoingConsentCall: Promise<{
-  consented: boolean | null
-  version: string | null
-}> | null = null
+const MAX_PENDING_CONSENT_RECORDS = 10
 
-// Get consent status from server
-export async function getServerConsentStatus(
-  config: AnalyticsConfig,
-): Promise<{ consented: boolean | null; version: string | null }> {
-  const CONSENT_API_URL = `${config.apiBaseUrl.replace(/\/$/, '')}/event/consent`
-  const apiUrl = `${CONSENT_API_URL}/status`
-
-  // If there's already an ongoing call, return it to prevent duplicate requests
-  if (ongoingConsentCall) {
-    debugLog(config, 'Reusing ongoing API call to:', { apiUrl })
-    return ongoingConsentCall
-  }
-
-  debugLog(config, 'Making new API call to:', { apiUrl })
-  ongoingConsentCall = (async () => {
-    try {
-      const response = await fetch(apiUrl, {
-        method: 'GET',
-        credentials: 'include',
-      })
-
-      debugLog(config, 'API response status:', { status: response.status })
-
-      if (!response.ok) {
-        debugLog(config, 'API call failed with status:', {
-          status: response.status,
-        })
-        throw new Error('Consent API failed')
-      }
-
-      const data = await response.json()
-      debugLog(config, 'API response data:', data)
-      return {
-        consented: data.consented,
-        version: data.version,
-      }
-    } catch (error) {
-      debugLog(config, 'API call error:', { error })
-      return { consented: null, version: null }
-    } finally {
-      // Clear the ongoing call flag
-      ongoingConsentCall = null
-    }
-  })()
-
-  return ongoingConsentCall
+/** Current policy version from the cached context, if known. */
+export function getCurrentPolicyVersion(): string | undefined {
+  const context = getGeoContext()
+  return context && isContextFresh(context) ? context.policyVersion : undefined
 }
 
-// Get consent status with caching
+function isContextFresh(context: { timestamp?: number; expiresAt?: number }): boolean {
+  const expiresAt = context.expiresAt ?? (context.timestamp ?? 0) + 24 * 60 * 60 * 1000
+  return Date.now() < expiresAt
+}
+
+/**
+ * The visitor's per-category choices for the current policy (synchronous). Choices made
+ * under a different policy version no longer count: the visitor is asked again (consent
+ * covers only the purposes the visitor was told about).
+ */
+export function getConsentCategories(config?: AnalyticsConfig): CategoryState {
+  const local = getLocalConsentStatus()
+  if (local.consented === null || local.consented === undefined) return { ...UNDECIDED }
+
+  const policyVersion = getCurrentPolicyVersion()
+  if (policyVersion && local.version !== policyVersion) {
+    debugLog(
+      config || { debug: false },
+      '[Consent] Stored decision is for another policy version; asking again',
+      { storedVersion: local.version, policyVersion },
+    )
+    return { ...UNDECIDED }
+  }
+  // Decisions stored before categories existed apply to every category.
+  return local.categories ? { ...local.categories } : allCategories(local.consented === true)
+}
+
+/**
+ * The overall decision: true when everything was accepted, false when decided otherwise
+ * (rejected, or a partial choice), null when undecided.
+ */
+export function getConsentDecision(config?: AnalyticsConfig): boolean | null {
+  const categories = getConsentCategories(config)
+  const values = OPTIONAL_CATEGORIES.map(category => categories[category])
+  if (values.some(value => value === null)) return null
+  return values.every(Boolean)
+}
+
+/**
+ * What may be sent where consent is required and statistics consent is not given:
+ * the collector's per-region policy, else the site setting, else 'limited'.
+ */
+export function getTrackingWithoutConsent(config?: AnalyticsConfig): 'limited' | 'none' {
+  const context = getGeoContext()
+  const fromPolicy = context && isContextFresh(context) ? context.trackingWithoutConsent : undefined
+  return fromPolicy ?? config?.consent?.trackingWithoutConsent ?? 'limited'
+}
+
+/** The visitor's consent decision (see getConsentDecision). */
 export async function getConsentStatus(
   config: AnalyticsConfig,
 ): Promise<{ consented: boolean | null; version: string | null }> {
-  const localStatus = getLocalConsentStatus()
-  const now = Date.now()
-  const lastCheck = localStatus.timestamp || 0
-  const cacheAge = now - lastCheck
-
-  // Calculate effective cache interval based on consent status
-  const nullConsentCacheInterval = Math.min(config.consentCheckInterval / 6, 10 * 60 * 1000)
-  const effectiveCacheInterval =
-    localStatus.consented === null ? nullConsentCacheInterval : config.consentCheckInterval
-  const gracePeriod = Math.min(effectiveCacheInterval / 4, 2 * 60 * 1000)
-
-  debugLog(config, '🔍 [Consent] Checking consent status', {
-    localStatus,
-    cacheAge,
-    checkInterval: config.consentCheckInterval,
-    effectiveCacheInterval,
-    gracePeriod,
-    willUseCache:
-      cacheAge < effectiveCacheInterval || cacheAge < effectiveCacheInterval + gracePeriod,
-  })
-
-  // Cache consent status regardless of whether it's null, true, or false
-  // For null consent (undecided users), use a shorter cache interval to avoid spam
-  // (effectiveCacheInterval and gracePeriod already calculated above)
-
-  // If we have cached data and it's not time to recheck yet, use the cached value
-  if (cacheAge < effectiveCacheInterval) {
-    debugLog(config, '✅ [Consent] Using cached consent status', {
-      localStatus,
-      effectiveCacheInterval,
-      cacheAge,
-    })
-    return {
-      consented: localStatus.consented,
-      version: localStatus.version,
-    }
+  return {
+    consented: getConsentDecision(config),
+    version: getLocalConsentStatus().version,
   }
-
-  // If cache is expired but we have a cached value, still use it for a grace period
-  // This prevents excessive network calls during scroll events
-  // (gracePeriod already calculated above)
-  if (cacheAge < effectiveCacheInterval + gracePeriod) {
-    debugLog(config, '✅ [Consent] Using cached consent status (grace period)', {
-      localStatus,
-      cacheAge,
-      effectiveCacheInterval,
-      gracePeriod,
-    })
-    return {
-      consented: localStatus.consented,
-      version: localStatus.version,
-    }
-  }
-
-  debugLog(config, '🔄 [Consent] Fetching fresh consent status from server', {
-    reason:
-      cacheAge >= effectiveCacheInterval + gracePeriod
-        ? 'cache expired'
-        : cacheAge === 0
-          ? 'no cached data (first visit)'
-          : 'cache expired',
-    cacheAge,
-    effectiveCacheInterval,
-    gracePeriod,
-  })
-
-  // Otherwise, check with the server
-  const serverStatus = await getServerConsentStatus(config)
-  debugLog(config, '📡 [Consent] Server consent response', { serverStatus })
-
-  // Always update local storage with the server response
-  setLocalConsentStatus(serverStatus.consented, serverStatus.version)
-
-  return serverStatus
 }
 
-// Set consent via server
-export async function setConsent(config: AnalyticsConfig, value: boolean): Promise<void> {
-  const CONSENT_API_URL = `${config.apiBaseUrl.replace(/\/$/, '')}/event/consent`
+/** Whether the browser sends Global Privacy Control and the site honors it (default). */
+export function isGlobalPrivacyControlEnabled(config?: AnalyticsConfig): boolean {
+  if (config?.respectGlobalPrivacyControl === false) return false
+  return typeof navigator !== 'undefined' && (navigator as any).globalPrivacyControl === true
+}
 
+function consentEndpoint(config: AnalyticsConfig): string {
+  return `${config.apiBaseUrl.replace(/\/$/, '')}/v1/consent`
+}
+
+async function postConsentRecord(config: AnalyticsConfig, record: ConsentRecord): Promise<boolean> {
   try {
-    const response = await fetch(`${CONSENT_API_URL}/update`, {
+    const response = await fetch(consentEndpoint(config), {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        name: config.eventSiteName,
-        consented: value,
-        origin: typeof window !== 'undefined' ? window.location.origin : '',
-        hostname: typeof window !== 'undefined' ? window.location.hostname : '',
-      }),
-      credentials: 'include',
+      // text/plain: a CORS "simple request" (no preflight); the collector parses JSON.
+      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+      body: JSON.stringify(record),
+      credentials: 'omit',
+      keepalive: true,
     })
-
-    if (!response.ok) {
-      throw new Error('Failed to set consent')
-    }
-
-    const data = await response.json()
-    setLocalConsentStatus(value, data.version || null)
-
-    // Set a client-side cookie to remember we've shown the banner
-    if (typeof document !== 'undefined') {
-      document.cookie = `ci_consent_shown=true; max-age=31536000; path=/; domain=${
-        typeof window !== 'undefined' ? window.location.hostname : ''
-      }`
-    }
-  } catch (error) {
-    console.warn('Failed to set consent:', error)
+    // 4xx other than 408/429 will never succeed; don't keep retrying those.
+    if (response.ok) return true
+    const retryable = response.status === 408 || response.status === 429 || response.status >= 500
+    if (!retryable)
+      debugLog(config, '[Consent] Record rejected', {
+        status: response.status,
+      })
+    return !retryable
+  } catch {
+    return false
   }
 }
 
-// Check if consent is required based on user's geo location
+function getPendingConsentRecords(): ConsentRecord[] {
+  const pending = getStorageItem<ConsentRecord[]>(STORAGE_KEYS.CONSENT_PENDING)
+  return Array.isArray(pending) ? pending : []
+}
+
+function setPendingConsentRecords(records: ConsentRecord[]): void {
+  if (records.length === 0) {
+    try {
+      localStorage.removeItem(STORAGE_KEYS.CONSENT_PENDING)
+    } catch {
+      // Ignore storage errors
+    }
+    return
+  }
+  setStorageItem(STORAGE_KEYS.CONSENT_PENDING, records.slice(-MAX_PENDING_CONSENT_RECORDS))
+}
+
+/** Re-send consent records that could not be delivered earlier (called on startup). */
+export async function flushPendingConsentRecords(config: AnalyticsConfig): Promise<void> {
+  const pending = getPendingConsentRecords()
+  if (pending.length === 0) return
+  const remaining: ConsentRecord[] = []
+  for (const record of pending) {
+    if (!(await postConsentRecord(config, record))) remaining.push(record)
+  }
+  setPendingConsentRecords(remaining)
+}
+
+/**
+ * Record the visitor's decision. It takes effect locally immediately; the consent record
+ * is then sent to the collector, and kept for retry if it cannot be delivered.
+ */
+export async function setConsent(
+  config: AnalyticsConfig,
+  value: boolean | Partial<CategoryChoices>,
+  source: 'banner' | 'api' = 'banner',
+): Promise<void> {
+  const previous = getLocalConsentStatus()
+  const consentId = previous.consentId ?? generateObjectId()
+  const policyVersion = getCurrentPolicyVersion() ?? previous.version ?? 'unknown'
+  const categories = typeof value === 'boolean' ? allCategories(value) : completeChoices(value)
+  const decision = decisionOf(categories)
+
+  setLocalConsentStatus(decision === 'granted', policyVersion, consentId, categories)
+
+  const record: ConsentRecord = {
+    v: 1,
+    siteKey: getSiteKey(config),
+    consentId,
+    decision,
+    categories,
+    policyVersion,
+    decidedAt: new Date().toISOString(),
+    source,
+  }
+  if (!(await postConsentRecord(config, record))) {
+    debugLog(config, '[Consent] Could not deliver consent record; will retry on next visit')
+    setPendingConsentRecords([...getPendingConsentRecords(), record])
+  }
+}
+
+// Check if consent is required based on the cached context (GET /v1/context)
 export function isConsentRequired(config?: AnalyticsConfig): boolean {
   if (typeof window === 'undefined') {
     debugLog(config || { debug: false }, 'Server-side: defaulting to require consent')
@@ -183,31 +192,13 @@ export function isConsentRequired(config?: AnalyticsConfig): boolean {
   }
 
   try {
-    const geoData = getGeoContext()
-    debugLog(config || { debug: false }, 'Geo context check', { geoData })
-
-    if (geoData) {
-      const age = Date.now() - (geoData.timestamp || 0)
-      // Use cached geo data if less than 24 hours old
-      if (age < 24 * 60 * 60 * 1000) {
-        const requiresConsent = geoData.requiresConsent === true
-        debugLog(config || { debug: false }, 'Consent requirement determined by geo', {
-          requiresConsent,
-          geoAge: age,
-        })
-        return requiresConsent
-      } else {
-        debugLog(config || { debug: false }, 'Geo data too old, defaulting to require consent', {
-          age,
-        })
-      }
-    } else {
-      debugLog(config || { debug: false }, 'No geo data available, defaulting to require consent')
+    const context = getGeoContext()
+    if (context && isContextFresh(context)) {
+      return context.requiresConsent === true
     }
+    debugLog(config || { debug: false }, 'No current context, defaulting to require consent')
   } catch (error) {
-    debugLog(config || { debug: false }, 'Error checking geo context', {
-      error,
-    })
+    debugLog(config || { debug: false }, 'Error checking context', { error })
   }
 
   return true // Default to requiring consent if unknown

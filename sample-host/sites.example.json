@@ -1,0 +1,9 @@
+[
+  {
+    "siteKey": "example-site",
+    "name": "Example website",
+    "allowedOrigins": ["https://www.example.com", "https://example.com"],
+    "policyVersion": "2026-11-01",
+    "consentMode": "geo"
+  }
+]

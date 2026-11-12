@@ -1,0 +1,16 @@
+{
+  "name": "example-vue",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build"
+  },
+  "dependencies": {
+    "vue": "3.5.45",
+    "vue-router": "5.4.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "6.0.10",
+    "vite": "8.3.6"
+  }
+}
