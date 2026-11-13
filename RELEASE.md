@@ -11,7 +11,7 @@ This repository publishes an MIT-licensed npm package. Application deployments a
 
 ## npm publication
 
-The publish workflow runs only when a GitHub release is published and the repository variable `NPM_RELEASES_ENABLED` is `true`. It verifies the tag, runs the checks, and publishes with public access using the `NPM_ACCESS_TOKEN` repository secret. Keep that token scoped to publishing this package; users installing a public release do not need it.
+The publish workflow runs only when a GitHub release is published and the repository variable `NPM_RELEASES_ENABLED` is `true`. It verifies the tag, runs the checks, and publishes with public access using npm trusted publishing (OIDC). Configure the trusted publisher before enabling the workflow; users installing the public package do not need credentials.
 
 Manual publication is `npm publish --access public`; `prepublishOnly` runs the checks first. Merely changing `publishConfig.access` does not change an existing restricted npm package or GitHub repository's visibility. Existing package access and GitHub visibility must be changed at launch by a maintainer.
 
@@ -23,11 +23,9 @@ Consumers can install a pinned public npm version or serve selected built files 
 
 Use a reviewed source snapshot or a reviewed and sanitized history. Replacing an example key in current files does not remove historical copies or revoke that key. Verify that any previously embedded key is revoked or intentionally public and adequately restricted before publishing the old history. Keep private configuration, environment files, source-control metadata and generated release archives out of the public export.
 
-## Prerelease integration
+## Stable release
 
-The prepared version is `0.1.0-rc.1`, published with the `next` tag. Stable releases
-use `latest`; a prerelease must not move that tag. Install the exact version in
-consumers until the production API and browser checks pass.
+The current stable version is `0.1.1`, published with the `latest` tag after production API and browser integration checks passed. Consumers pin this stable version. The historical `v0.1.0` GitHub release is preserved; it predates the current public package integration. Future prereleases use `next` and must not move `latest`.
 
 The release workflow uses npm trusted publishing (OIDC), with no publish token.
 Configure the package's trusted publisher for the final Clear Ideas repository name
