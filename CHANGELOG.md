@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1 — November 12, 2026
+
+Stable publication of the production-validated public browser package. Runtime behavior is unchanged from `0.1.0-rc.1`; release metadata and consumer versions move to stable.
+
 ## Unreleased
 
 ### Third-party tools
